@@ -1,9 +1,9 @@
 from typing import Sequence, Tuple, List
-
 import torch
 import torch.nn.functional as F
 from torchgeo.models import resnet50, ResNet50_Weights
 from skimage.segmentation import slic
+from skimage.graph import rag_mean_color
 import numpy as np
 
 @torch.inference_mode()
@@ -56,4 +56,6 @@ def extract_features(
     X.scatter_add_(0, idx.T, F_flat.T)                 # sum features per SP
     X = (X.T / denom).T                                # mean -> [N, 2048]
 
-    return X.cpu(), sp
+    rag = rag_mean_color(img_rgb, sp)   # Region Adjacency Graph over Superpixels
+
+    return X.cpu(), sp, rag

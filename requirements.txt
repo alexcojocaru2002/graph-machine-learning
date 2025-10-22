@@ -1,6 +1,8 @@
-numpy
+numpy==1.24
 pandas
 torch
 torchvision
 torchgeo
 scikit-image
+karateclub
+networkx>=3.0
