@@ -1,0 +1,51 @@
+# Example training configuration for GAT-based superpixel area regression
+
+data_dir: data/train
+class_csv: data/class_dict.csv
+
+# Resize images before feature extraction (optional)
+img_size_w: 512
+img_size_h: 512
+
+# Train with multiple SLIC k values; dataset will include each (image, k)
+k_values: [300, 500, 700]
+
+cache_features: true
+cache_dir: artifacts/features
+normalize_targets: true
+precompute: true
+
+# Loader
+batch_size: 32
+num_workers: 4
+shuffle: true
+feature_device: cuda
+
+# Model
+in_dim: 2048
+hidden_dim: 256
+out_activation: None
+num_layers: 3
+num_heads: 4
+gat_dropout: 0.2
+integrate_dropout: 0.2
+normalize_node_features: true
+
+# Stability
+use_amp: true
+grad_clip_norm: 1.0
+loss_type: kl  # mse | kl
+
+# Optim
+lr: 0.0002
+weight_decay: 0.0001
+epochs: 20
+
+# Device
+device: cuda
+
+# Logging
+out_dir: artifacts
+log_interval: 10
+
+

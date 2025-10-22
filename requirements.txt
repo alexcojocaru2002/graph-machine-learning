@@ -4,3 +4,5 @@ torch
 torchvision
 torchgeo
 scikit-image
+pyyaml
+tqdm
