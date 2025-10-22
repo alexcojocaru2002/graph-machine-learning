@@ -1,9 +1,6 @@
-from skimage.measure import regionprops
 import torch
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
-from skimage.segmentation import slic
-from skimage.graph import rag_mean_color
 from skimage import graph
 from skimage.color import label2rgb
 from feature_extractor import extract_features       # the version that accepts img_t (+ optionally img_rgb)
