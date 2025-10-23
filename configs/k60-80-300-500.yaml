@@ -8,12 +8,13 @@ img_size_w: 512
 img_size_h: 512
 
 # Train with multiple SLIC k values; dataset will include each (image, k)
-k_values: [300, 500, 700]
+k_values: [60, 80, 300, 500]
 
 cache_features: true
 cache_dir: artifacts/features
 normalize_targets: true
 precompute: true
+hsv_threshold: 0.2
 
 # Loader
 batch_size: 32
@@ -22,11 +23,11 @@ shuffle: true
 feature_device: cuda
 
 # Model
-in_dim: 2048
-hidden_dim: 256
-out_activation: None
-num_layers: 3
-num_heads: 4
+in_dim: 1024
+hidden_dim: 512
+out_activation: none
+num_layers: 2
+num_heads: 3
 gat_dropout: 0.2
 integrate_dropout: 0.2
 normalize_node_features: true

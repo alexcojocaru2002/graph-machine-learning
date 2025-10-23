@@ -10,6 +10,8 @@ import torch
 from torch.utils.data import DataLoader
 import torch.nn.functional as F
 import torch.optim as optim
+import random
+import json
 try:
     # Prefer new torch.amp API
     from torch.amp import autocast as torch_autocast, GradScaler as TorchGradScaler
@@ -20,6 +22,7 @@ except Exception:
 from load_palette import load_class_palette
 from datasets.graph_superpixel_dataset import GraphSuperpixelDataset
 from models.gat import SPNodeRegressor
+from torchvision.models import vgg16, VGG16_Weights
 
 try:
     import yaml
@@ -39,24 +42,29 @@ class TrainConfig:
     class_csv: str = "data/class_dict.csv"
     img_size_w: Optional[int] = None
     img_size_h: Optional[int] = None
-    k_values: Sequence[int] = (400, 600)
+    k_values: Sequence[int] = (60, 80)  # paper suggests ~50-90 superpixels
     cache_features: bool = True
     cache_dir: str = "artifacts/features"
     normalize_targets: bool = True
     feature_device: str = "cpu"  # device for CNN feature extraction (cpu recommended)
     precompute: bool = True
+    hsv_threshold: float = 0.2
 
     # Loader
     batch_size: int = 1  # each graph is a sample; batching graphs of variable N kept as 1 for simplicity
     num_workers: int = 0
     shuffle: bool = True
 
+    # Split (deterministic train/val within train dir)
+    val_fraction: float = 0.1
+    split_seed: int = 42
+
     # Model
-    in_dim: int = 2048
-    hidden_dim: int = 256
-    out_activation: str = "relu"  # positive areas
-    num_layers: int = 3
-    num_heads: int = 4
+    in_dim: int = 1024
+    hidden_dim: int = 512
+    out_activation: str = "none"  # raw logits for regression loss selection
+    num_layers: int = 2
+    num_heads: int = 3
     gat_dropout: float = 0.2
     integrate_dropout: float = 0.2
     normalize_node_features: bool = True
@@ -64,7 +72,7 @@ class TrainConfig:
     # Training stability
     use_amp: bool = True
     grad_clip_norm: float = 1.0
-    loss_type: str = "mse"  # mse | kl
+    loss_type: str = "kl"  # mse | kl (paper uses soft targets + KL)
 
     # Optim
     lr: float = 2e-4
@@ -113,18 +121,43 @@ def mse_loss_area(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
 
 
 def kl_loss_area(pred_logits: torch.Tensor, target_probs: torch.Tensor) -> torch.Tensor:
-    # Expect target_probs to be probabilities; small epsilon for numerical stability
-    eps = 1e-8
-    target = target_probs.clamp(min=eps)
-    log_pred = F.log_softmax(pred_logits, dim=-1)
-    return F.kl_div(log_pred, target, reduction="batchmean")
+    """
+    KL(target || softmax(logits)) averaged over VALID nodes only.
+
+    - Masks out superpixels with zero mass after excluding the unknown class
+      (i.e., rows where sum(target_probs)==0), since they carry no training signal.
+    - Renormalizes valid target rows to sum exactly to 1 to ensure a proper distribution.
+    """
+    with torch.no_grad():
+        row_sum = target_probs.sum(dim=-1, keepdim=True)
+        valid_mask = (row_sum.squeeze(-1) > 0)
+
+    if not torch.any(valid_mask):
+        return pred_logits.sum() * 0.0  # zero loss if no valid nodes
+
+    # Select only valid rows and renormalize to form exact distributions
+    target_valid = target_probs[valid_mask]
+    row_sum_valid = row_sum[valid_mask]
+    target_valid = target_valid / row_sum_valid
+
+    log_pred_valid = F.log_softmax(pred_logits[valid_mask], dim=-1)
+    return F.kl_div(log_pred_valid, target_valid, reduction="batchmean")
 
 
 def train_loop(cfg: TrainConfig) -> None:
+    # Warm up VGG16 weights cache in the main process before DataLoader workers spawn
+    try:
+        _ = vgg16(weights=VGG16_Weights.IMAGENET1K_V1)
+    except Exception:
+        pass
+
     names, class_rgb_values, unknown_index = load_class_palette(cfg.class_csv)
     img_size = None
     if cfg.img_size_w is not None and cfg.img_size_h is not None:
         img_size = (int(cfg.img_size_w), int(cfg.img_size_h))
+
+    # Build and share a single VGG16 features backbone instance
+    backbone = vgg16(weights=VGG16_Weights.IMAGENET1K_V1).features.to(cfg.feature_device).eval()
 
     ds = GraphSuperpixelDataset(
         data_dir=cfg.data_dir,
@@ -136,16 +169,31 @@ def train_loop(cfg: TrainConfig) -> None:
         feature_device=cfg.feature_device,
         cache_features=cfg.cache_features,
         cache_dir=cfg.cache_dir,
+        hsv_threshold=cfg.hsv_threshold,
         normalize_targets=cfg.normalize_targets,
         precompute=cfg.precompute,
+        backbone=backbone,
     )
+
+    # Deterministic split of images into train/val (val excluded from training)
+    num_images = len(ds.base_ds)
+    image_indices = list(range(num_images))
+    rng = random.Random(cfg.split_seed)
+    rng.shuffle(image_indices)
+    n_val = int(round(max(0.0, min(1.0, cfg.val_fraction)) * num_images))
+    val_image_set = set(image_indices[:n_val]) if n_val > 0 else set()
+
+    # Map to dataset sample indices (image_idx, k)
+    train_sample_indices = [i for i, (img_idx, _k) in enumerate(ds.index_map) if img_idx not in val_image_set]
+    # Note: we do not use the val subset here; kept only for evaluation to avoid leakage
+    ds_train = torch.utils.data.Subset(ds, train_sample_indices)
 
     # Determine output dimension after excluding unknown
     num_classes_eff = len(class_rgb_values) - (1 if (unknown_index is not None and 0 <= unknown_index < len(class_rgb_values)) else 0)
 
     pin_memory = (torch.device(cfg.device).type == "cuda")
     loader = DataLoader(
-        ds,
+        ds_train,
         batch_size=cfg.batch_size,
         shuffle=cfg.shuffle,
         num_workers=cfg.num_workers,
@@ -155,6 +203,7 @@ def train_loop(cfg: TrainConfig) -> None:
     )
 
     device = torch.device(cfg.device)
+    final_act = (None if cfg.out_activation in ("none", None) else cfg.out_activation)
     model = SPNodeRegressor(
         in_dim=cfg.in_dim,
         hidden_dim=cfg.hidden_dim,
@@ -163,7 +212,7 @@ def train_loop(cfg: TrainConfig) -> None:
         num_heads=cfg.num_heads,
         dropout=cfg.gat_dropout,
         integrate_dropout=cfg.integrate_dropout,
-        final_activation=cfg.out_activation,
+        final_activation=final_act,
     ).to(device)
 
     optimizer = optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
@@ -222,6 +271,31 @@ def train_loop(cfg: TrainConfig) -> None:
             "optimizer_state": optimizer.state_dict(),
             "config": cfg.__dict__,
         }, ckpt_path)
+        # Save sidecar JSON with architecture to ensure correct loading later
+        arch = {
+            "model_class": "SPNodeRegressor",
+            "in_dim": cfg.in_dim,
+            "hidden_dim": cfg.hidden_dim,
+            "out_dim": num_classes_eff,
+            "num_layers": cfg.num_layers,
+            "num_heads": cfg.num_heads,
+            "dropout": cfg.gat_dropout,
+            "integrate_dropout": cfg.integrate_dropout,
+            "activation": "relu",
+            "final_activation": final_act,
+            "add_self_loops": False,
+            "normalize_node_features": cfg.normalize_node_features,
+            "split_seed": cfg.split_seed,
+            "val_fraction": cfg.val_fraction,
+        }
+        # Persist the actual validation image ids (stems) for exact reproducibility
+        try:
+            val_ids = [Path(ds.base_ds.image_paths[i]).stem for i in sorted(val_image_set)]
+        except Exception:
+            val_ids = []
+        meta = {"architecture": arch, "train_config": cfg.__dict__, "val_image_ids": val_ids}
+        with open(ckpt_path.with_suffix('.json'), 'w') as f:
+            json.dump(meta, f, indent=2)
         print(f"Saved checkpoint: {ckpt_path}")
 
 
@@ -241,6 +315,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--normalize_targets", action="store_true")
     p.add_argument("--no_normalize_targets", action="store_true")
     p.add_argument("--feature_device", type=str, default=None)
+    p.add_argument("--hsv_threshold", type=float, default=None)
 
     # Loader
     p.add_argument("--batch_size", type=int, default=None)

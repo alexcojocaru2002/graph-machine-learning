@@ -1,8 +1,8 @@
-from typing import Sequence, Tuple, List, Optional
+from typing import Optional, Tuple
 
 import torch
 import torch.nn.functional as F
-from torchgeo.models import resnet50, ResNet50_Weights
+from torchvision.models import vgg16, VGG16_Weights
 from skimage.segmentation import slic
 import numpy as np
 
@@ -15,70 +15,84 @@ except Exception:
 @torch.inference_mode()
 def extract_features(
     img_t: torch.Tensor,          # [3,H,W] or [1,3,H,W], normalized
-    img_rgb: np.ndarray | None,   # [H,W,3] uint8; if None, we’ll reconstruct from img_t
+    img_rgb: np.ndarray,          # [H,W,3] uint8
     k: int = 500,
     device: str | torch.device = "cpu",
     backbone: Optional[torch.nn.Module] = None,
     use_amp: bool = True,
-):
+) -> Tuple[torch.Tensor, np.ndarray]:
     """
+    Paper-accurate feature extraction:
+      - Backbone: VGG16 pretrained on ImageNet
+      - Use conv4_3 and conv5_3 feature maps (512 + 512 = 1024 channels)
+      - Upsample both maps to original image size (H, W)
+      - Segment image with SLIC into k superpixels
+      - For each channel, take the MAX within each superpixel region to get node features
+
     Returns:
-        X:  torch.FloatTensor [N, 2048]  superpixel features
+        X:  torch.FloatTensor [N, 1024]  superpixel features (max over region)
         sp: np.ndarray [H, W]            superpixel labels (0..N-1)
     """
     if img_t.ndim == 3:
-        x = img_t.unsqueeze(0)                  # [1,3,H,W]
-    elif img_t.ndim == 4:
-        x = img_t                               # [N,3,H,W] (assume N==1 for this function)
+        x = img_t.unsqueeze(0)
+    else:
+        x = img_t
 
-    # Move to device & get H,W
     x = x.to(device)
     _, _, H, W = x.shape
 
-    # 1) Backbone
+    # Build VGG16 and capture conv4_3 and conv5_3 activations
     local_backbone = backbone
     if local_backbone is None:
-        local_backbone = resnet50(
-            weights=ResNet50_Weights.FMOW_RGB_GASSL,
-            num_classes=0,
-            global_pool="",
-        ).to(device).eval()
+        local_backbone = vgg16(weights=VGG16_Weights.IMAGENET1K_V1).features.to(device).eval()
 
+    feats = []
     with torch_autocast(device_type=str(device), enabled=(use_amp and torch.device(device).type == "cuda")):
-        Fm = local_backbone(x)               # [1, 2048, h, w]
-    _, C, h, w = Fm.shape
-    Fm = Fm[0]                     # [2048, h, w]
+        out = x
+        for i, layer in enumerate(local_backbone):
+            out = layer(out)
+            # After relu following conv4_3 (index 22), and after relu following conv5_3 (index 29)
+            if i in (22, 29):
+                feats.append(out)
+            if i >= 29 and len(feats) == 2:
+                break
 
+    F4, F5 = feats  # [1,512,h4,w4], [1,512,h5,w5]
+    # Upsample to image size
+    F4_up = F.interpolate(F4, size=(H, W), mode="bilinear", align_corners=False)[0]  # [512,H,W]
+    F5_up = F.interpolate(F5, size=(H, W), mode="bilinear", align_corners=False)[0]  # [512,H,W]
+    Fcat = torch.cat([F4_up, F5_up], dim=0).contiguous()  # [1024,H,W]
+
+    # SLIC on original RGB
     sp = slic(img_rgb, n_segments=k, compactness=10, start_label=0)  # [H,W]
     N = int(sp.max()) + 1
 
-    # 3) Downsample superpixel map to (h,w) and masked mean pooling
-    sp_small = torch.from_numpy(sp)[None, None].float().to(device)   # [1,1,H,W]
-    sp_small = F.interpolate(sp_small, size=(h, w), mode="nearest")[0, 0].long()  # [h,w]
+    # Max over each superpixel region per channel
+    sp_t = torch.from_numpy(sp).to(device)
+    sp_flat = sp_t.reshape(-1)
+    C = Fcat.shape[0]
+    X = torch.full((N, C), -float("inf"), dtype=Fcat.dtype, device=device)
+    F_flat = Fcat.reshape(C, -1)
+    for c in range(C):
+        vals = F_flat[c]
+        # include_self=True preserves existing -inf for empty clusters
+        X[:, c].scatter_reduce_(0, sp_flat, vals, reduce='amax', include_self=True)
 
-    F_flat = Fm.reshape(C, -1)             # [C, h*w]
-    sp_flat = sp_small.reshape(-1)         # [h*w]
+    # Replace -inf (empty) with 0
+    X[~torch.isfinite(X)] = 0.0
 
-    ones = torch.ones(h * w, dtype=F_flat.dtype, device=device)
-    denom = torch.zeros(N, dtype=F_flat.dtype, device=device).scatter_add_(0, sp_flat, ones) + 1e-6  # [N]
-
-    X = torch.zeros(N, C, dtype=F_flat.dtype, device=device)
-    idx = sp_flat.unsqueeze(0).expand(C, -1)           # [C, h*w]
-    X.scatter_add_(0, idx.T, F_flat.T)                 # sum features per SP
-    X = (X.T / denom).T                                # mean -> [N, 2048]
-
-    return X.cpu(), sp
+    return X.detach().to("cpu"), sp
 
 
 @torch.inference_mode()
-def compute_backbone_map(
+def compute_backbone_maps_vgg(
     img_t: torch.Tensor,
     device: str | torch.device = "cpu",
     backbone: Optional[torch.nn.Module] = None,
     use_amp: bool = True,
-) -> torch.Tensor:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Return feature map Fm: FloatTensor [C, h, w]
+    Return VGG16 conv4_3 and conv5_3 feature maps as (F4, F5): each FloatTensor [512, h, w] on CPU.
     """
     if img_t.ndim == 3:
         x = img_t.unsqueeze(0)
@@ -87,42 +101,48 @@ def compute_backbone_map(
     x = x.to(device)
     local_backbone = backbone
     if local_backbone is None:
-        local_backbone = resnet50(
-            weights=ResNet50_Weights.FMOW_RGB_GASSL,
-            num_classes=0,
-            global_pool="",
-        ).to(device).eval()
+        local_backbone = vgg16(weights=VGG16_Weights.IMAGENET1K_V1).features.to(device).eval()
+    feats = []
     with torch_autocast(device_type=str(device), enabled=(use_amp and torch.device(device).type == "cuda")):
-        Fm = local_backbone(x)  # [1, C, h, w]
-    return Fm[0].detach().to("cpu")  # [C, h, w] on CPU
+        out = x
+        for i, layer in enumerate(local_backbone):
+            out = layer(out)
+            if i in (22, 29):
+                feats.append(out)
+            if i >= 29 and len(feats) == 2:
+                break
+    F4, F5 = feats
+    return F4[0].detach().to("cpu"), F5[0].detach().to("cpu")
 
 
 @torch.inference_mode()
-def pool_from_backbone_map(
-    Fm: torch.Tensor,  # [C, h, w] on CPU or device
-    sp: np.ndarray,    # [H, W] int labels
+def pool_from_backbone_maps_max(
+    F4: torch.Tensor,  # [512, h4, w4]
+    F5: torch.Tensor,  # [512, h5, w5]
+    sp: np.ndarray,    # [H, W]
     device: str | torch.device = "cpu",
 ) -> torch.Tensor:
     """
-    Aggregate backbone feature map to superpixel features using mean pooling.
-    Returns X: FloatTensor [N, C]
+    Aggregate VGG conv4_3 and conv5_3 feature maps to superpixel features using MAX pooling.
+    Returns X: FloatTensor [N, 1024]
     """
     if isinstance(device, str):
         device = torch.device(device)
-    C, h, w = Fm.shape
-    # Move to device
-    Fm = Fm.to(device)
-    # Downsample sp to (h, w)
-    sp_small = torch.from_numpy(sp)[None, None].float().to(device)
-    sp_small = F.interpolate(sp_small, size=(h, w), mode="nearest")[0, 0].long()  # [h,w]
+    H, W = sp.shape
+    F4 = F4.to(device)
+    F5 = F5.to(device)
+    F4_up = F.interpolate(F4.unsqueeze(0), size=(H, W), mode="bilinear", align_corners=False)[0]
+    F5_up = F.interpolate(F5.unsqueeze(0), size=(H, W), mode="bilinear", align_corners=False)[0]
+    Fcat = torch.cat([F4_up, F5_up], dim=0)  # [1024,H,W]
 
+    sp_t = torch.from_numpy(sp).to(device)
+    sp_flat = sp_t.reshape(-1)
+    C = Fcat.shape[0]
     N = int(sp.max()) + 1
-    F_flat = Fm.reshape(C, -1)             # [C, h*w]
-    sp_flat = sp_small.reshape(-1)         # [h*w]
-    ones = torch.ones(h * w, dtype=F_flat.dtype, device=device)
-    denom = torch.zeros(N, dtype=F_flat.dtype, device=device).scatter_add_(0, sp_flat, ones) + 1e-6
-    X = torch.zeros(N, C, dtype=F_flat.dtype, device=device)
-    idx = sp_flat.unsqueeze(0).expand(C, -1)           # [C, h*w]
-    X.scatter_add_(0, idx.T, F_flat.T)                 # sum features per SP
-    X = (X.T / denom).T                                # [N, C]
+    X = torch.full((N, C), -float("inf"), dtype=Fcat.dtype, device=device)
+    F_flat = Fcat.reshape(C, -1)
+    for c in range(C):
+        vals = F_flat[c]
+        X[:, c].scatter_reduce_(0, sp_flat, vals, reduce='amax', include_self=True)
+    X[~torch.isfinite(X)] = 0.0
     return X.detach().to("cpu")

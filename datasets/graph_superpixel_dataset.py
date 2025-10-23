@@ -2,13 +2,20 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
+import os
+import tempfile
+import hashlib
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset
 
 from dataset_loader import DeepGlobeDataset
-from feature_extractor import extract_features, compute_backbone_map, pool_from_backbone_map
+from feature_extractor import (
+    extract_features,
+    compute_backbone_maps_vgg,
+    pool_from_backbone_maps_max,
+)
 from utils.graph_utils import compute_edge_index_from_superpixels, compute_superpixel_area_targets
 from skimage.segmentation import slic
 
@@ -40,12 +47,17 @@ class GraphSuperpixelDataset(Dataset):
         feature_device: str | torch.device = "cpu",
         cache_features: bool = False,
         cache_dir: str | Path = "artifacts/features",
+        # Optional: also cache backbone feature maps per image to accelerate multi-k runs and reuse across sessions
+        cache_backbone_maps: bool = True,
+        backbone_cache_dir: Optional[str | Path] = None,
         normalize_targets: bool = True,
         precompute: bool = True,
         slic_compactness: float = 10.0,
         slic_sigma: float = 0.0,
         slic_start_label: int = 0,
         use_amp: bool = True,
+        hsv_threshold: float = 0.2,
+        backbone: Optional[torch.nn.Module] = None,
     ) -> None:
         super().__init__()
         self.base_ds = DeepGlobeDataset(str(data_dir), class_rgb_values, img_size=img_size)
@@ -62,6 +74,13 @@ class GraphSuperpixelDataset(Dataset):
         self.slic_sigma = float(slic_sigma)
         self.slic_start_label = int(slic_start_label)
         self.use_amp = bool(use_amp)
+        self.hsv_threshold = float(hsv_threshold)
+        self.backbone = backbone  # Optional pre-instantiated VGG16 features module placed on feature_device
+        self.cache_backbone_maps = bool(cache_backbone_maps)
+        if backbone_cache_dir is None:
+            self.backbone_cache_dir = Path(cache_dir) / "backbone_maps"
+        else:
+            self.backbone_cache_dir = Path(backbone_cache_dir)
 
         # Build index mapping from linear idx -> (image_idx, k)
         self.index_map: List[Tuple[int, int]] = []
@@ -71,6 +90,8 @@ class GraphSuperpixelDataset(Dataset):
 
         if self.cache_features:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
+            if self.cache_backbone_maps:
+                self.backbone_cache_dir.mkdir(parents=True, exist_ok=True)
 
         self.num_classes_eff = len(class_rgb_values) - (1 if (unknown_index is not None and 0 <= unknown_index < len(class_rgb_values)) else 0)
 
@@ -81,11 +102,58 @@ class GraphSuperpixelDataset(Dataset):
     def __len__(self) -> int:
         return len(self.index_map)
 
-    def _cache_key(self, image_path: str, k: int, img_size: Optional[Tuple[int, int]]) -> Path:
-        name = Path(image_path).with_suffix("").name  # strip extension
+    def _features_cache_key(self, image_path: str, k: int, img_size: Optional[Tuple[int, int]]) -> Path:
+        # Features depend on: image identity, resize size, k, SLIC params, backbone arch/weights
+        name = Path(image_path).with_suffix("").name
         size_tag = "none" if img_size is None else f"{img_size[0]}x{img_size[1]}"
-        fname = f"{name}_k{k}_size{size_tag}.npz"
+        slic_tag = f"c{int(self.slic_compactness)}_s{int(self.slic_sigma*10)}_st{self.slic_start_label}"
+        bb_tag = "vgg16_i1kv1"
+        h = hashlib.sha1(str(Path(image_path)).encode("utf-8")).hexdigest()[:10]
+        fname = f"{name}_k{k}_size{size_tag}_slic-{slic_tag}_bb-{bb_tag}_{h}.npz"
         return self.cache_dir / fname
+
+    def _adj_cache_key(self, image_path: str, k: int, img_size: Optional[Tuple[int, int]], hsv_threshold: float) -> Path:
+        # Adjacency depends on sp (image, size, k, slic params) and hsv_threshold
+        name = Path(image_path).with_suffix("").name
+        size_tag = "none" if img_size is None else f"{img_size[0]}x{img_size[1]}"
+        slic_tag = f"c{int(self.slic_compactness)}_s{int(self.slic_sigma*10)}_st{self.slic_start_label}"
+        t_tag = f"t{int(hsv_threshold*1000)}"
+        h = hashlib.sha1(str(Path(image_path)).encode("utf-8")).hexdigest()[:10]
+        fname = f"{name}_k{k}_size{size_tag}_slic-{slic_tag}_{t_tag}_adj_{h}.npz"
+        return self.cache_dir / fname
+
+    def _backbone_cache_key(self, image_path: str, img_size: Optional[Tuple[int, int]]) -> Path:
+        name = Path(image_path).with_suffix("").name
+        size_tag = "none" if img_size is None else f"{img_size[0]}x{img_size[1]}"
+        bb_tag = "vgg16_i1kv1"
+        h = hashlib.sha1(str(Path(image_path)).encode("utf-8")).hexdigest()[:10]
+        fname = f"{name}_size{size_tag}_bb-{bb_tag}_{h}.npz"
+        return self.backbone_cache_dir / fname
+
+    def _legacy_features_cache_key(self, image_path: str, k: int, img_size: Optional[Tuple[int, int]]) -> Path:
+        # Backward compatibility: older caches included hsv_threshold and omitted SLIC params, backbone tag
+        name = Path(image_path).with_suffix("").name
+        size_tag = "none" if img_size is None else f"{img_size[0]}x{img_size[1]}"
+        h = hashlib.sha1(str(Path(image_path)).encode("utf-8")).hexdigest()[:10]
+        fname = f"{name}_k{k}_size{size_tag}_t{int(self.hsv_threshold*1000)}_{h}.npz"
+        return self.cache_dir / fname
+
+    @staticmethod
+    def _atomic_savez(path: Path, **arrays) -> None:
+        path = Path(path)
+        tmp_dir = path.parent
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(dir=str(tmp_dir), delete=False, suffix=".npz") as tmp:
+            tmp_name = tmp.name
+        try:
+            np.savez_compressed(tmp_name, **arrays)
+            os.replace(tmp_name, path)
+        finally:
+            try:
+                if os.path.exists(tmp_name):
+                    os.remove(tmp_name)
+            except Exception:
+                pass
 
     def __getitem__(self, idx: int):
         image_idx, k = self.index_map[idx]
@@ -96,21 +164,101 @@ class GraphSuperpixelDataset(Dataset):
         # Try cache
         X: Optional[torch.Tensor] = None
         sp: Optional[np.ndarray] = None
-        cache_path = self._cache_key(image_path, k, self.base_ds.img_size)
-        if self.cache_features and cache_path.exists():
-            data = np.load(cache_path)
-            X = torch.from_numpy(data["X"])  # [N, 2048]
+        feat_cache_path = self._features_cache_key(image_path, k, self.base_ds.img_size)
+        if self.cache_features and feat_cache_path.exists():
+            data = np.load(feat_cache_path)
+            X = torch.from_numpy(data["X"])  # [N, 1024]
             sp = data["sp"].astype(np.int64)
+            edge_index = None  # adjacency cached separately
+        elif self.cache_features:
+            # Backward-compat: try legacy cache naming
+            legacy_path = self._legacy_features_cache_key(image_path, k, self.base_ds.img_size)
+            if legacy_path.exists():
+                try:
+                    data = np.load(legacy_path)
+                    X = torch.from_numpy(data["X"])  # [N,1024]
+                    sp = data["sp"].astype(np.int64)
+                    # Migrate to new cache key for future runs
+                    try:
+                        self._atomic_savez(feat_cache_path, X=X.numpy(), sp=sp)
+                    except Exception:
+                        pass
+                    # If legacy had adjacency, we'll migrate it below when we look for adj cache
+                except Exception:
+                    X, sp = None, None
         else:
             # Compute now (slower). Prefer calling precompute() once to populate cache.
-            Fm = compute_backbone_map(img_t, device=self.feature_device, backbone=None, use_amp=self.use_amp)
-            sp = slic(img_rgb, n_segments=k, compactness=self.slic_compactness, sigma=self.slic_sigma, start_label=self.slic_start_label)
-            X = pool_from_backbone_map(Fm, sp, device=self.feature_device)
+            # Try to reuse cached backbone maps
+            use_cached_backbone = False
+            if self.cache_features and self.cache_backbone_maps:
+                bb_path = self._backbone_cache_key(image_path, self.base_ds.img_size)
+                if bb_path.exists():
+                    try:
+                        bb = np.load(bb_path)
+                        F4 = torch.from_numpy(bb["F4"])  # [512,h4,w4]
+                        F5 = torch.from_numpy(bb["F5"])  # [512,h5,w5]
+                        use_cached_backbone = True
+                    except Exception:
+                        pass
+            if not use_cached_backbone:
+                F4, F5 = compute_backbone_maps_vgg(img_t, device=self.feature_device, backbone=self.backbone, use_amp=self.use_amp)
+                if self.cache_features and self.cache_backbone_maps:
+                    try:
+                        self._atomic_savez(self._backbone_cache_key(image_path, self.base_ds.img_size), F4=F4.numpy(), F5=F5.numpy())
+                    except Exception:
+                        pass
+            sp = slic(
+                img_rgb,
+                n_segments=k,
+                compactness=self.slic_compactness,
+                sigma=self.slic_sigma,
+                start_label=self.slic_start_label,
+            )
+            X = pool_from_backbone_maps_max(F4, F5, sp, device=self.feature_device)
             if self.cache_features:
-                np.savez_compressed(cache_path, X=X.numpy(), sp=sp)
+                try:
+                    self._atomic_savez(feat_cache_path, X=X.numpy(), sp=sp)
+                except Exception:
+                    pass
 
         # Adjacency graph
-        edge_index = compute_edge_index_from_superpixels(sp)  # [2, E]
+        # Adjacency graph (cached separately by hsv_threshold)
+        adj_cache_path = self._adj_cache_key(image_path, k, self.base_ds.img_size, self.hsv_threshold)
+        if self.cache_features and adj_cache_path.exists():
+            try:
+                adj = np.load(adj_cache_path)
+                edge_index = torch.from_numpy(adj["edge_index"]).long()
+            except Exception:
+                edge_index = None
+        else:
+            edge_index = None
+            # Backward-compat: if using legacy features cache that stored edge_index, reuse and migrate
+            if self.cache_features:
+                try:
+                    legacy_path = self._legacy_features_cache_key(image_path, k, self.base_ds.img_size)
+                    if legacy_path.exists():
+                        data = np.load(legacy_path)
+                        if "edge_index" in data.files:
+                            edge_index = torch.from_numpy(data["edge_index"]).long()
+                            try:
+                                self._atomic_savez(adj_cache_path, edge_index=edge_index.numpy())
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+        if edge_index is None:
+            edge_index = compute_edge_index_from_superpixels(
+                sp,
+                connectivity=8,
+                rgb=img_rgb,
+                hsv_threshold=self.hsv_threshold,
+                add_self_loops=True,
+            )  # [2, E]
+            if self.cache_features:
+                try:
+                    self._atomic_savez(adj_cache_path, edge_index=edge_index.numpy())
+                except Exception:
+                    pass
 
         # Targets from mask
         mask_np = mask_t.numpy().astype(np.int64)
@@ -146,21 +294,66 @@ class GraphSuperpixelDataset(Dataset):
         if tqdm is not None:
             iterator = tqdm(iterator, desc="Precompute CNN+SLIC")
 
-        # Reuse one backbone instance via compute_backbone_map (by passing backbone as None here we let it lazily create once per call).
-        backbone = None
+        # Reuse one backbone instance if provided; otherwise lazily instantiate once here
+        if self.backbone is None:
+            from torchvision.models import vgg16, VGG16_Weights
+            self.backbone = vgg16(weights=VGG16_Weights.IMAGENET1K_V1).features.to(self.feature_device).eval()
 
         for i in iterator:
             img_t, img_rgb, _ = self.base_ds[i]
             image_path = self.base_ds.image_paths[i]
-            # Compute backbone map once per image
-            Fm = compute_backbone_map(img_t, device=self.feature_device, backbone=backbone, use_amp=self.use_amp)
+            # Load or compute backbone feature maps once per image
+            F4: Optional[torch.Tensor] = None
+            F5: Optional[torch.Tensor] = None
+            if self.cache_backbone_maps:
+                bb_path = self._backbone_cache_key(image_path, self.base_ds.img_size)
+                if bb_path.exists():
+                    try:
+                        bb = np.load(bb_path)
+                        F4 = torch.from_numpy(bb["F4"])  # [512,h4,w4]
+                        F5 = torch.from_numpy(bb["F5"])  # [512,h5,w5]
+                    except Exception:
+                        F4, F5 = None, None
+            if (F4 is None) or (F5 is None):
+                F4, F5 = compute_backbone_maps_vgg(img_t, device=self.feature_device, backbone=self.backbone, use_amp=self.use_amp)
+                if self.cache_backbone_maps:
+                    try:
+                        self._atomic_savez(self._backbone_cache_key(image_path, self.base_ds.img_size), F4=F4.numpy(), F5=F5.numpy())
+                    except Exception:
+                        pass
             # For each k, compute SLIC and pooled features if not cached
             for k in self.k_values:
-                cache_path = self._cache_key(image_path, k, self.base_ds.img_size)
-                if cache_path.exists():
-                    continue
-                sp = slic(img_rgb, n_segments=k, compactness=self.slic_compactness, sigma=self.slic_sigma, start_label=self.slic_start_label)
-                X = pool_from_backbone_map(Fm, sp, device=self.feature_device)
-                np.savez_compressed(cache_path, X=X.numpy(), sp=sp)
+                feat_cache_path = self._features_cache_key(image_path, k, self.base_ds.img_size)
+                if feat_cache_path.exists():
+                    # Skip if X/sp already exist in cache
+                    try:
+                        data = np.load(feat_cache_path)
+                        if ("X" in data) and ("sp" in data):
+                            continue
+                    except Exception:
+                        pass
+                else:
+                    # If legacy exists, migrate and skip
+                    legacy_path = self._legacy_features_cache_key(image_path, k, self.base_ds.img_size)
+                    if legacy_path.exists():
+                        try:
+                            data = np.load(legacy_path)
+                            if ("X" in data) and ("sp" in data):
+                                self._atomic_savez(feat_cache_path, X=data["X"], sp=data["sp"])
+                                continue
+                        except Exception:
+                            pass
+                sp = slic(
+                    img_rgb,
+                    n_segments=k,
+                    compactness=self.slic_compactness,
+                    sigma=self.slic_sigma,
+                    start_label=self.slic_start_label,
+                )
+                X = pool_from_backbone_maps_max(F4, F5, sp, device=self.feature_device)
+                try:
+                    self._atomic_savez(feat_cache_path, X=X.numpy(), sp=sp)
+                except Exception:
+                    pass
 
 
