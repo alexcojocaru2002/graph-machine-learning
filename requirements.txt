@@ -6,3 +6,4 @@ torchgeo
 scikit-image
 pyyaml
 tqdm
+wandb
