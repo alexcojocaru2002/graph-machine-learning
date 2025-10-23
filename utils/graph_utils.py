@@ -1,15 +1,25 @@
 from __future__ import annotations
 
-from typing import Iterable, Optional, Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 import torch
+from skimage.color import rgb2hsv
 
 
-def compute_edge_index_from_superpixels(sp: np.ndarray, connectivity: int = 8) -> torch.Tensor:
+def compute_edge_index_from_superpixels(
+    sp: np.ndarray,
+    connectivity: int = 8,
+    rgb: Optional[np.ndarray] = None,
+    hsv_threshold: Optional[float] = None,
+    add_self_loops: bool = True,
+) -> torch.Tensor:
     """
-    Build a directed edge_index [2, E] for an adjacency graph where nodes are superpixels.
-    Two nodes are connected if their superpixels touch (4- or 8-connectivity).
+    Build a directed edge_index [2, E] for superpixel adjacency.
+    - Two nodes are adjacent if superpixels touch (4- or 8-connectivity).
+    - If hsv_threshold is provided and rgb is given, keep edge (i,j) only if ||v_i - v_j||_2 <= hsv_threshold
+      where v_i is mean HSV of region i (values in [0,1]).
+    - If add_self_loops, include (i,i) for all nodes.
     """
     assert sp.ndim == 2, "superpixel map must be 2D"
     H, W = sp.shape
@@ -48,6 +58,39 @@ def compute_edge_index_from_superpixels(sp: np.ndarray, connectivity: int = 8) -
             a, b = int(sp[y, x + 1]), int(sp[y + 1, x])
             neighbors.add((a, b))
             neighbors.add((b, a))
+
+    # Optional HSV similarity filtering
+    if hsv_threshold is not None and rgb is not None:
+        hsv = rgb2hsv(rgb.astype(np.float32) / 255.0)
+        # Vectorized mean HSV per region using bincount
+        flat_ids = sp.reshape(-1).astype(np.int64)
+        hsv_flat = hsv.reshape(-1, 3).astype(np.float32)
+        counts = np.bincount(flat_ids, minlength=N).astype(np.int64)
+        # Avoid division by zero
+        counts_safe = counts.copy()
+        counts_safe[counts_safe == 0] = 1
+        sums = np.stack([
+            np.bincount(flat_ids, weights=hsv_flat[:, 0], minlength=N),
+            np.bincount(flat_ids, weights=hsv_flat[:, 1], minlength=N),
+            np.bincount(flat_ids, weights=hsv_flat[:, 2], minlength=N),
+        ], axis=1).astype(np.float32)
+        means = sums / counts_safe[:, None]
+
+        filtered = set()
+        t = float(hsv_threshold)
+        for (a, b) in neighbors:
+            if a == b:
+                filtered.add((a, b))
+                continue
+            dv = means[a] - means[b]
+            dist = float(np.sqrt(np.sum(dv * dv)))
+            if dist <= t:
+                filtered.add((a, b))
+        neighbors = filtered
+
+    if add_self_loops:
+        for i in range(N):
+            neighbors.add((i, i))
 
     if len(neighbors) == 0:
         return torch.zeros((2, 0), dtype=torch.long)

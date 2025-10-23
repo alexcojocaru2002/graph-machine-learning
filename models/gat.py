@@ -25,7 +25,7 @@ class GraphAttentionLayer(nn.Module):
         dropout: float = 0.0,
         negative_slope: float = 0.2,
         bias: bool = True,
-        add_self_loops: bool = True,
+        add_self_loops: bool = False,
     ) -> None:
         super().__init__()
         self.in_dim = in_dim
@@ -35,16 +35,14 @@ class GraphAttentionLayer(nn.Module):
         self.add_self_loops = add_self_loops
 
         self.linear = nn.Linear(in_dim, out_dim, bias=False)
-        self.attn_src = nn.Parameter(torch.empty(out_dim))
-        self.attn_dst = nn.Parameter(torch.empty(out_dim))
+        self.attn = nn.Parameter(torch.empty(2 * out_dim))  # a in paper for [Wh_i || Wh_j]
         self.bias = nn.Parameter(torch.zeros(out_dim)) if bias else None
 
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
         nn.init.xavier_uniform_(self.linear.weight)
-        nn.init.xavier_uniform_(self.attn_src.unsqueeze(0))
-        nn.init.xavier_uniform_(self.attn_dst.unsqueeze(0))
+        nn.init.xavier_uniform_(self.attn.unsqueeze(0))
         if self.bias is not None:
             nn.init.zeros_(self.bias)
 
@@ -60,12 +58,12 @@ class GraphAttentionLayer(nn.Module):
                 [edge_index, torch.stack((self_loops, self_loops), dim=0)], dim=1
             )
 
-        # Compute unnormalized attention coefficients for each edge
+        # Compute unnormalized attention coefficients for each edge via concatenation
         src, dst = edge_index[0], edge_index[1]  # [E]
         h_src = h[src]  # [E, out_dim]
         h_dst = h[dst]  # [E, out_dim]
-
-        e = (h_src * self.attn_src).sum(dim=-1) + (h_dst * self.attn_dst).sum(dim=-1)  # [E]
+        e_input = torch.cat([h_src, h_dst], dim=-1)  # [E, 2*out_dim]
+        e = (e_input * self.attn).sum(dim=-1)
         e = F.leaky_relu(e, negative_slope=self.negative_slope)
 
         # Normalize with softmax over incoming edges per node (dst as the recipient)
@@ -115,7 +113,7 @@ class MultiHeadGATLayer(nn.Module):
         dropout: float = 0.0,
         negative_slope: float = 0.2,
         concat: bool = True,
-        add_self_loops: bool = True,
+        add_self_loops: bool = False,
     ) -> None:
         super().__init__()
         self.concat = concat
@@ -144,12 +142,13 @@ class MultiLayerIntegratedGAT(nn.Module):
         in_dim: int,
         hidden_dim: int,
         out_dim: int,
-        num_layers: int = 3,
-        num_heads: int = 4,
+        num_layers: int = 2,
+        num_heads: int = 3,
         dropout: float = 0.2,
         integrate_dropout: float = 0.2,
-        activation: str = "elu",
-        add_self_loops: bool = True,
+        activation: str = "relu",
+        add_self_loops: bool = False,
+        use_batchnorm: bool = True,
     ) -> None:
         super().__init__()
         assert num_layers >= 1
@@ -158,41 +157,47 @@ class MultiLayerIntegratedGAT(nn.Module):
         self.activation = activation
 
         layers: List[nn.Module] = []
+        norms: List[nn.Module] = []
         dims: List[int] = []
 
         # First layer expands/adjusts dimension
         layers.append(MultiHeadGATLayer(in_dim, hidden_dim, num_heads=num_heads, dropout=dropout, concat=True, add_self_loops=add_self_loops))
         dims.append(hidden_dim * num_heads)
+        norms.append(nn.BatchNorm1d(dims[-1]) if use_batchnorm else nn.Identity())
 
         # Hidden layers
         for _ in range(1, num_layers):
             layers.append(MultiHeadGATLayer(dims[-1], hidden_dim, num_heads=num_heads, dropout=dropout, concat=True, add_self_loops=add_self_loops))
             dims.append(hidden_dim * num_heads)
+            norms.append(nn.BatchNorm1d(dims[-1]) if use_batchnorm else nn.Identity())
 
         self.gat_layers = nn.ModuleList(layers)
+        self.norm_layers = nn.ModuleList(norms)
 
-        fused_dim = sum(dims)
+        # Multi-layer integration via SUM across layers as per paper
+        fused_dim = dims[-1]
         self.fusion = nn.Sequential(
             nn.Dropout(integrate_dropout),
-            nn.Linear(fused_dim, hidden_dim),
-            nn.ELU(),
-            nn.Dropout(integrate_dropout),
-            nn.Linear(hidden_dim, out_dim),
+            nn.Linear(fused_dim, out_dim),
         )
 
     def forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
         representations: List[torch.Tensor] = []
         h = x
-        for layer in self.gat_layers:
+        for layer, norm in zip(self.gat_layers, self.norm_layers):
             h = layer(h, edge_index)
-            if self.activation == "elu":
-                h = F.elu(h)
-            elif self.activation == "relu":
+            if self.activation == "relu":
                 h = F.relu(h)
+            elif self.activation == "elu":
+                h = F.elu(h)
+            h = norm(h)
             representations.append(h)
 
-        h_cat = torch.cat(representations, dim=-1)
-        out = self.fusion(h_cat)
+        # Sum integration
+        h_sum = representations[0]
+        for r in representations[1:]:
+            h_sum = h_sum + r
+        out = self.fusion(h_sum)
         return out
 
 
@@ -210,9 +215,9 @@ class SPNodeRegressor(nn.Module):
         num_heads: int = 4,
         dropout: float = 0.2,
         integrate_dropout: float = 0.2,
-        activation: str = "elu",
+        activation: str = "relu",
         final_activation: Optional[str] = "relu",
-        add_self_loops: bool = True,
+        add_self_loops: bool = False,
     ) -> None:
         super().__init__()
         self.core = MultiLayerIntegratedGAT(
