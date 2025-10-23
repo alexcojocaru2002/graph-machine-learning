@@ -23,6 +23,19 @@ from load_palette import load_class_palette
 from datasets.graph_superpixel_dataset import GraphSuperpixelDataset
 from models.gat import SPNodeRegressor
 from torchvision.models import vgg16, VGG16_Weights
+from utils.logger import TrainLogger
+from utils.metrics import (
+    collect_image_scores,
+    calibrate_thresholds,
+    example_based_metrics,
+    collect_regression_data,
+    mae_weighted_nodes,
+    rmse_weighted_nodes,
+    per_class_regression_scores_images,
+    soft_dice_per_class,
+    js_divergence_images,
+    emd_1d_images,
+)
 
 try:
     import yaml
@@ -73,6 +86,8 @@ class TrainConfig:
     use_amp: bool = True
     grad_clip_norm: float = 1.0
     loss_type: str = "kl"  # mse | kl (paper uses soft targets + KL)
+    use_wandb: bool = False
+    eval_every_epochs: int = 5
 
     # Optim
     lr: float = 2e-4
@@ -221,6 +236,37 @@ def train_loop(cfg: TrainConfig) -> None:
     out_dir = Path(cfg.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Build validation dataset with non-normalized targets for metrics
+    ds_full_counts = GraphSuperpixelDataset(
+        data_dir=cfg.data_dir,
+        class_rgb_values=class_rgb_values,
+        unknown_index=unknown_index,
+        k_values=cfg.k_values,
+        img_size=img_size,
+        device=cfg.device,
+        feature_device=cfg.feature_device,
+        cache_features=cfg.cache_features,
+        cache_dir=cfg.cache_dir,
+        hsv_threshold=cfg.hsv_threshold,
+        normalize_targets=False,
+        precompute=cfg.precompute,
+        backbone=backbone,
+    )
+    val_sample_indices = [i for i, (img_idx, _k) in enumerate(ds_full_counts.index_map) if img_idx in val_image_set]
+    ds_val_counts = torch.utils.data.Subset(ds_full_counts, val_sample_indices)
+    val_loader = DataLoader(
+        ds_val_counts,
+        batch_size=cfg.batch_size,
+        shuffle=False,
+        num_workers=cfg.num_workers,
+        collate_fn=collate_graphs,
+        pin_memory=pin_memory,
+        persistent_workers=(cfg.num_workers > 0),
+    )
+
+    # Initialize logger
+    logger = TrainLogger(use_wandb=cfg.use_wandb, project="graph-ml", run_name=None, config=cfg.__dict__)
+
     step = 0
     for epoch in range(cfg.epochs):
         model.train()
@@ -261,6 +307,9 @@ def train_loop(cfg: TrainConfig) -> None:
                 iterator.set_postfix({"loss": f"{avg:.6f}"})
             if (step % cfg.log_interval) == 0 and tqdm is None:
                 print(f"epoch {epoch} step {step}: loss {running / (i + 1):.6f}")
+            # Step-wise logging
+            if cfg.use_wandb:
+                logger.log({"train/loss": float(loss.item()), "train/epoch": epoch}, step=step)
             step += 1
 
         # Save checkpoint after each epoch
@@ -298,6 +347,69 @@ def train_loop(cfg: TrainConfig) -> None:
             json.dump(meta, f, indent=2)
         print(f"Saved checkpoint: {ckpt_path}")
 
+        # Epoch-level logging
+        if cfg.use_wandb:
+            avg_loss = running / max(1, (i + 1))
+            logger.log({"train/loss_epoch": float(avg_loss), "epoch": epoch}, step=step)
+
+        # Periodic evaluation on validation split
+        if (cfg.eval_every_epochs is not None) and (cfg.eval_every_epochs > 0) and ((epoch + 1) % int(cfg.eval_every_epochs) == 0):
+            model.eval()
+            with torch.inference_mode():
+                # Classification-style metrics
+                y_score_val, y_true_val = collect_image_scores(model, val_loader, cfg.normalize_node_features)
+                thresholds = calibrate_thresholds(y_score_val, y_true_val, beta=2.0)
+                p, r, f1, f2 = example_based_metrics(y_true_val, y_score_val, thresholds)
+
+                # Regression-style metrics
+                reg = collect_regression_data(model, val_loader, cfg.normalize_node_features)
+                metrics_to_log = {
+                    "val/precision": float(p),
+                    "val/recall": float(r),
+                    "val/f1": float(f1),
+                    "val/f2": float(f2),
+                }
+                nodes = reg["nodes"]
+                if nodes["y_true"].numel() > 0:
+                    y_true_nodes = nodes["y_true"].numpy()
+                    y_pred_nodes = nodes["y_pred"].numpy()
+                    w_nodes = nodes["weights"].numpy()
+                    metrics_to_log.update({
+                        "val/node_mae": float(mae_weighted_nodes(y_true_nodes, y_pred_nodes, w_nodes)),
+                        "val/node_rmse": float(rmse_weighted_nodes(y_true_nodes, y_pred_nodes, w_nodes)),
+                    })
+                images = reg["images"]
+                if images["y_true"].numel() > 0:
+                    y_true_img = images["y_true"].numpy()
+                    y_pred_img = images["y_pred"].numpy()
+                    w_img = images["weights"].numpy()
+                    img_scores = per_class_regression_scores_images(y_true_img, y_pred_img, w_img)
+                    dice_pc, dice_macro = soft_dice_per_class(y_true_img, y_pred_img)
+                    js_img = js_divergence_images(y_true_img, y_pred_img)
+                    emd_img = emd_1d_images(y_true_img, y_pred_img)
+                    metrics_to_log.update({
+                        "val/img_mae_macro": float(img_scores["macro"]["mae"]),
+                        "val/img_rmse_macro": float(img_scores["macro"]["rmse"]),
+                        "val/img_r2_macro": float(img_scores["macro"]["r2"]),
+                        "val/img_smape_macro": float(img_scores["macro"]["smape"]),
+                        "val/img_js": float(js_img),
+                        "val/img_dice_macro": float(dice_macro),
+                        "val/img_emd": float(emd_img),
+                    })
+
+                # Print concise summary
+                print(f"Eval@epoch {epoch}: F1={metrics_to_log.get('val/f1', float('nan')):.4f} F2={metrics_to_log.get('val/f2', float('nan')):.4f} "
+                      f"nodeMAE={metrics_to_log.get('val/node_mae', float('nan')):.4f} imgMAE={metrics_to_log.get('val/img_mae_macro', float('nan')):.4f}")
+
+                if cfg.use_wandb:
+                    logger.log(metrics_to_log, step=step)
+
+    # Finish logger
+    try:
+        logger.finish()
+    except Exception:
+        pass
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train GAT-based superpixel area regressor")
@@ -330,6 +442,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num_heads", type=int, default=None)
     p.add_argument("--gat_dropout", type=float, default=None)
     p.add_argument("--integrate_dropout", type=float, default=None)
+    p.add_argument("--use_wandb", action="store_true")
+    p.add_argument("--eval_every_epochs", type=int, default=None)
 
     # Optim
     p.add_argument("--lr", type=float, default=None)
@@ -378,6 +492,10 @@ def merge_config(default: TrainConfig, yaml_cfg: dict, args: argparse.Namespace)
         cfg_dict["normalize_targets"] = False
     if args.no_shuffle:
         cfg_dict["shuffle"] = False
+    if hasattr(args, "use_wandb") and args.use_wandb:
+        cfg_dict["use_wandb"] = True
+    if hasattr(args, "eval_every_epochs") and (args.eval_every_epochs is not None):
+        cfg_dict["eval_every_epochs"] = int(args.eval_every_epochs)
 
     # k_values may be provided as space-separated ints
     kv = cfg_dict.get("k_values")
