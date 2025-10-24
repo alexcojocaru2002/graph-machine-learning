@@ -69,7 +69,8 @@ class GraphSuperpixelDataset(Dataset):
         self.k_values = list(k_values)
         self.device = torch.device(device)
         self.feature_device = torch.device(feature_device)
-        self.cache_features = cache_features
+        # Deprecated flag; caching is always enabled
+        self.cache_features = True
         self.cache_dir = Path(cache_dir)
         self.normalize_targets = normalize_targets
         self.precompute_flag = precompute
@@ -94,15 +95,15 @@ class GraphSuperpixelDataset(Dataset):
             for k in self.k_values:
                 self.index_map.append((i, k))
 
-        if self.cache_features:
-            self.cache_dir.mkdir(parents=True, exist_ok=True)
-            if self.cache_backbone_maps:
-                self.backbone_cache_dir.mkdir(parents=True, exist_ok=True)
+        # Always ensure caches exist
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        if self.cache_backbone_maps:
+            self.backbone_cache_dir.mkdir(parents=True, exist_ok=True)
 
         self.num_classes_eff = len(class_rgb_values) - (1 if (unknown_index is not None and 0 <= unknown_index < len(class_rgb_values)) else 0)
 
         # Optional upfront precompute of all features and SLIC to avoid runtime overhead
-        if self.cache_features and self.precompute_flag:
+        if self.precompute_flag:
             print(f"[GraphSuperpixelDataset] Starting precompute: images={len(self.base_ds)}, ks={list(self.k_values)}; feature_batch_size={self.feature_batch_size}")
             self.precompute()
 
@@ -172,33 +173,32 @@ class GraphSuperpixelDataset(Dataset):
         X: Optional[torch.Tensor] = None
         sp: Optional[np.ndarray] = None
         feat_cache_path = self._features_cache_key(image_path, k, self.base_ds.img_size)
-        if self.cache_features and feat_cache_path.exists():
+        if feat_cache_path.exists():
             data = np.load(feat_cache_path, mmap_mode='r')
             X = torch.from_numpy(data["X"])  # [N, 1024]
             sp = data["sp"].astype(np.int64)
             edge_index = None  # adjacency cached separately
         else:
             # Backward-compat: try legacy cache naming
-            if self.cache_features:
-                legacy_path = self._legacy_features_cache_key(image_path, k, self.base_ds.img_size)
-                if legacy_path.exists():
+            legacy_path = self._legacy_features_cache_key(image_path, k, self.base_ds.img_size)
+            if legacy_path.exists():
+                try:
+                    data = np.load(legacy_path, mmap_mode='r')
+                    X = torch.from_numpy(data["X"])  # [N,1024]
+                    sp = data["sp"].astype(np.int64)
+                    # Migrate to new cache key for future runs
                     try:
-                        data = np.load(legacy_path, mmap_mode='r')
-                        X = torch.from_numpy(data["X"])  # [N,1024]
-                        sp = data["sp"].astype(np.int64)
-                        # Migrate to new cache key for future runs
-                        try:
-                            self._atomic_savez(feat_cache_path, X=X.numpy(), sp=sp)
-                        except Exception:
-                            pass
+                        self._atomic_savez(feat_cache_path, X=X.numpy(), sp=sp)
                     except Exception:
-                        X, sp = None, None
+                        pass
+                except Exception:
+                    X, sp = None, None
             # If still missing, compute now and persist if caching enabled
             if X is None or sp is None:
                 # Try to reuse cached backbone maps
                 F4 = None
                 F5 = None
-                if self.cache_features and self.cache_backbone_maps:
+                if self.cache_backbone_maps:
                     bb_path = self._backbone_cache_key(image_path, self.base_ds.img_size)
                     if bb_path.exists():
                         try:
@@ -209,7 +209,7 @@ class GraphSuperpixelDataset(Dataset):
                             F4, F5 = None, None
                 if (F4 is None) or (F5 is None):
                     F4, F5 = compute_backbone_maps_vgg(img_t, device=self.feature_device, backbone=self.backbone, use_amp=self.use_amp)
-                    if self.cache_features and self.cache_backbone_maps:
+                    if self.cache_backbone_maps:
                         try:
                             self._atomic_savez(self._backbone_cache_key(image_path, self.base_ds.img_size), F4=F4.numpy(), F5=F5.numpy())
                         except Exception:
@@ -223,16 +223,15 @@ class GraphSuperpixelDataset(Dataset):
                     backend=self.slic_backend,
                 )
                 X = pool_from_backbone_maps_max(F4, F5, sp, device=self.feature_device)
-                if self.cache_features:
-                    try:
-                        self._atomic_savez(feat_cache_path, X=X.numpy(), sp=sp)
-                    except Exception:
-                        pass
+                try:
+                    self._atomic_savez(feat_cache_path, X=X.numpy(), sp=sp)
+                except Exception:
+                    pass
 
         # Adjacency graph
         # Adjacency graph (cached separately by hsv_threshold)
         adj_cache_path = self._adj_cache_key(image_path, k, self.base_ds.img_size, self.hsv_threshold)
-        if self.cache_features and adj_cache_path.exists():
+        if adj_cache_path.exists():
             try:
                 adj = np.load(adj_cache_path, mmap_mode='r')
                 edge_index = torch.from_numpy(adj["edge_index"]).long()
@@ -241,19 +240,18 @@ class GraphSuperpixelDataset(Dataset):
         else:
             edge_index = None
             # Backward-compat: if using legacy features cache that stored edge_index, reuse and migrate
-            if self.cache_features:
-                try:
-                    legacy_path = self._legacy_features_cache_key(image_path, k, self.base_ds.img_size)
-                    if legacy_path.exists():
-                        data = np.load(legacy_path, mmap_mode='r')
-                        if "edge_index" in data.files:
-                            edge_index = torch.from_numpy(data["edge_index"]).long()
-                            try:
-                                self._atomic_savez(adj_cache_path, edge_index=edge_index.numpy())
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
+            try:
+                legacy_path = self._legacy_features_cache_key(image_path, k, self.base_ds.img_size)
+                if legacy_path.exists():
+                    data = np.load(legacy_path, mmap_mode='r')
+                    if "edge_index" in data.files:
+                        edge_index = torch.from_numpy(data["edge_index"]).long()
+                        try:
+                            self._atomic_savez(adj_cache_path, edge_index=edge_index.numpy())
+                        except Exception:
+                            pass
+            except Exception:
+                pass
         if edge_index is None:
             edge_index = compute_edge_index_from_superpixels(
                 sp,
@@ -262,11 +260,10 @@ class GraphSuperpixelDataset(Dataset):
                 hsv_threshold=self.hsv_threshold,
                 add_self_loops=True,
             )  # [2, E]
-            if self.cache_features:
-                try:
-                    self._atomic_savez(adj_cache_path, edge_index=edge_index.numpy())
-                except Exception:
-                    pass
+            try:
+                self._atomic_savez(adj_cache_path, edge_index=edge_index.numpy())
+            except Exception:
+                pass
 
         # Targets from mask
         mask_np = mask_t.numpy().astype(np.int64)
@@ -296,8 +293,7 @@ class GraphSuperpixelDataset(Dataset):
         Precompute backbone feature maps per image (once) and SLIC+pooled features for each k,
         saving (X, sp) to cache. Skips files already cached.
         """
-        if not self.cache_features:
-            return
+        # Always precompute when called
 
         # Ensure backbone is ready on feature_device
         if self.backbone is None:
