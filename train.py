@@ -472,6 +472,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--feature_batch_size", type=int, default=None)
     p.add_argument("--precompute_workers", type=int, default=None)
     p.add_argument("--slic_backend", type=str, default=None, choices=["cpu"])  # fixed to skimage
+    p.add_argument("--precompute", action="store_true")
+    p.add_argument("--no_precompute", action="store_true")
 
     # Loader
     p.add_argument("--batch_size", type=int, default=None)
@@ -544,6 +546,10 @@ def merge_config(default: TrainConfig, yaml_cfg: dict, args: argparse.Namespace)
         cfg_dict["use_wandb"] = True
     if hasattr(args, "eval_every_epochs") and (args.eval_every_epochs is not None):
         cfg_dict["eval_every_epochs"] = int(args.eval_every_epochs)
+    if hasattr(args, "precompute") and args.precompute:
+        cfg_dict["precompute"] = True
+    if hasattr(args, "no_precompute") and args.no_precompute:
+        cfg_dict["precompute"] = False
     if hasattr(args, "feature_batch_size") and (args.feature_batch_size is not None):
         cfg_dict["feature_batch_size"] = int(args.feature_batch_size)
     if hasattr(args, "precompute_workers") and (args.precompute_workers is not None):

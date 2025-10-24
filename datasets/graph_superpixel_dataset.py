@@ -132,6 +132,13 @@ class GraphSuperpixelDataset(Dataset):
         fname = f"{name}_k{k}_size{size_tag}_slic-{slic_tag}_bb-{bb_tag}_{h}.npz"
         return self.cache_dir / fname
 
+    def _features_cache_paths_npy(self, image_path: str, k: int, img_size: Optional[Tuple[int, int]]) -> Tuple[Path, Path]:
+        base_npz = self._features_cache_key(image_path, k, img_size)
+        base = str(base_npz.with_suffix(""))
+        x_path = Path(base + "_X.npy")
+        sp_path = Path(base + "_sp.npy")
+        return x_path, sp_path
+
     def _adj_cache_key(self, image_path: str, k: int, img_size: Optional[Tuple[int, int]], hsv_threshold: float) -> Path:
         # Adjacency depends on sp (image, size, k, slic params) and hsv_threshold
         name = Path(image_path).with_suffix("").name
@@ -141,6 +148,11 @@ class GraphSuperpixelDataset(Dataset):
         h = hashlib.sha1(str(Path(image_path)).encode("utf-8")).hexdigest()[:10]
         fname = f"{name}_k{k}_size{size_tag}_slic-{slic_tag}_{t_tag}_adj_{h}.npz"
         return self.cache_dir / fname
+
+    def _adj_cache_path_npy(self, image_path: str, k: int, img_size: Optional[Tuple[int, int]], hsv_threshold: float) -> Path:
+        base_npz = self._adj_cache_key(image_path, k, img_size, hsv_threshold)
+        base = str(base_npz.with_suffix(""))
+        return Path(base + "_edge_index.npy")
 
     def _backbone_cache_key(self, image_path: str, img_size: Optional[Tuple[int, int]]) -> Path:
         name = Path(image_path).with_suffix("").name
@@ -199,11 +211,19 @@ class GraphSuperpixelDataset(Dataset):
             X, sp = _GLOBAL_FEATURES[gkey_feat]
         # Disk cache if needed
         feat_cache_path = self._features_cache_key(image_path, k, self.base_ds.img_size)
-        if (X is None or sp is None) and feat_cache_path.exists():
-            data = np.load(feat_cache_path, mmap_mode='r')
-            X = torch.from_numpy(data["X"])  # [N, 1024]
-            sp = data["sp"].astype(np.int64)
-            edge_index = None  # adjacency cached separately
+        x_path, sp_path = self._features_cache_paths_npy(image_path, k, self.base_ds.img_size)
+        if (X is None or sp is None):
+            # Prefer fast .npy memory-mapped loads
+            try:
+                if x_path.exists() and sp_path.exists():
+                    X = torch.from_numpy(np.load(x_path, mmap_mode='r'))
+                    sp = np.load(sp_path, mmap_mode='r').astype(np.int64)
+                elif feat_cache_path.exists():
+                    data = np.load(feat_cache_path, mmap_mode='r')
+                    X = torch.from_numpy(data["X"])  # [N, 1024]
+                    sp = data["sp"].astype(np.int64)
+            except Exception:
+                X, sp = X, sp
         else:
             # Backward-compat: try legacy cache naming
             legacy_path = self._legacy_features_cache_key(image_path, k, self.base_ds.img_size)
@@ -249,8 +269,14 @@ class GraphSuperpixelDataset(Dataset):
                     backend=self.slic_backend,
                 )
                 X = pool_from_backbone_maps_max(F4, F5, sp, device=self.feature_device)
+                # Persist both legacy .npz and fast .npy for future runs
                 try:
                     self._atomic_savez(feat_cache_path, X=X.numpy(), sp=sp)
+                except Exception:
+                    pass
+                try:
+                    np.save(x_path, X.numpy())
+                    np.save(sp_path, sp)
                 except Exception:
                     pass
         # Populate global memory cache
@@ -259,11 +285,18 @@ class GraphSuperpixelDataset(Dataset):
         # Adjacency graph
         # Adjacency graph (cached separately by hsv_threshold)
         adj_cache_path = self._adj_cache_key(image_path, k, self.base_ds.img_size, self.hsv_threshold)
+        adj_npy_path = self._adj_cache_path_npy(image_path, k, self.base_ds.img_size, self.hsv_threshold)
         # Try in-memory adjacency cache first
         gkey_adj = (image_path, int(k), float(self.hsv_threshold))
         global _GLOBAL_ADJ
         if gkey_adj in _GLOBAL_ADJ:
             edge_index = _GLOBAL_ADJ[gkey_adj]
+        elif adj_npy_path.exists():
+            try:
+                ei = np.load(adj_npy_path, mmap_mode='r')
+                edge_index = torch.from_numpy(ei).long()
+            except Exception:
+                edge_index = None
         elif adj_cache_path.exists():
             try:
                 adj = np.load(adj_cache_path, mmap_mode='r')
@@ -293,6 +326,11 @@ class GraphSuperpixelDataset(Dataset):
                 hsv_threshold=self.hsv_threshold,
                 add_self_loops=True,
             )  # [2, E]
+            # Persist in both formats (npy for speed, npz for backwards compatibility)
+            try:
+                np.save(adj_npy_path, edge_index.numpy())
+            except Exception:
+                pass
             try:
                 self._atomic_savez(adj_cache_path, edge_index=edge_index.numpy())
             except Exception:
