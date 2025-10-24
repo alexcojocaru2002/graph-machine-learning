@@ -225,7 +225,8 @@ def train_loop(cfg: TrainConfig) -> None:
     # Determine output dimension after excluding unknown
     num_classes_eff = len(class_rgb_values) - (1 if (unknown_index is not None and 0 <= unknown_index < len(class_rgb_values)) else 0)
 
-    pin_memory = (torch.device(cfg.device).type == "cuda")
+    device = torch.device(cfg.device)
+    pin_memory = (device.type == "cuda")
     loader = DataLoader(
         ds_train,
         batch_size=cfg.batch_size,
@@ -238,7 +239,6 @@ def train_loop(cfg: TrainConfig) -> None:
         pin_memory_device=(device.type if hasattr(torch.utils.data, 'DataLoader') else None),
     )
 
-    device = torch.device(cfg.device)
     final_act = (None if cfg.out_activation in ("none", None) else cfg.out_activation)
     model = SPNodeRegressor(
         in_dim=cfg.in_dim,
