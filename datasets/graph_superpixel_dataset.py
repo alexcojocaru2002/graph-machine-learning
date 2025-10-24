@@ -158,6 +158,15 @@ class GraphSuperpixelDataset(Dataset):
         fname = f"{name}_k{k}_size{size_tag}_t{int(self.hsv_threshold*1000)}_{h}.npz"
         return self.cache_dir / fname
 
+    def _labels_cache_key(self, image_path: str, k: int, img_size: Optional[Tuple[int, int]]) -> Path:
+        # Labels depend on image identity, resize size, k, SLIC params, and unknown handling via num_classes_eff
+        name = Path(image_path).with_suffix("").name
+        size_tag = "none" if img_size is None else f"{img_size[0]}x{img_size[1]}"
+        slic_tag = f"c{int(self.slic_compactness)}_s{int(self.slic_sigma*10)}_st{self.slic_start_label}"
+        h = hashlib.sha1(str(Path(image_path)).encode("utf-8")).hexdigest()[:10]
+        fname = f"{name}_k{k}_size{size_tag}_slic-{slic_tag}_ycounts_{h}.npz"
+        return self.cache_dir / fname
+
     @staticmethod
     def _atomic_savez(path: Path, **arrays) -> None:
         path = Path(path)
@@ -291,15 +300,31 @@ class GraphSuperpixelDataset(Dataset):
         # Populate in-memory adjacency cache
         _GLOBAL_ADJ[gkey_adj] = edge_index
 
-        # Targets from mask
-        mask_np = mask_t.numpy().astype(np.int64)
-        y = compute_superpixel_area_targets(
-            sp=sp,
-            mask=mask_np,
-            num_classes=len(self.class_rgb_values),
-            unknown_index=self.unknown_index,
-            normalize=self.normalize_targets,
-        )  # [N, C_eff]
+        # Targets from mask (cache y counts per (image,k))
+        labels_cache_path = self._labels_cache_key(image_path, k, self.base_ds.img_size)
+        try:
+            if labels_cache_path.exists():
+                lab = np.load(labels_cache_path, mmap_mode='r')
+                y = torch.from_numpy(lab["y"]).float()
+            else:
+                mask_np = mask_t.numpy().astype(np.int64)
+                y = compute_superpixel_area_targets(
+                    sp=sp,
+                    mask=mask_np,
+                    num_classes=len(self.class_rgb_values),
+                    unknown_index=self.unknown_index,
+                    normalize=self.normalize_targets,
+                )
+                self._atomic_savez(labels_cache_path, y=y.numpy())
+        except Exception:
+            mask_np = mask_t.numpy().astype(np.int64)
+            y = compute_superpixel_area_targets(
+                sp=sp,
+                mask=mask_np,
+                num_classes=len(self.class_rgb_values),
+                unknown_index=self.unknown_index,
+                normalize=self.normalize_targets,
+            )
 
         sample = {
             "x": X.float(),

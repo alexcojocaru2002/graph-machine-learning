@@ -235,6 +235,7 @@ def train_loop(cfg: TrainConfig) -> None:
         pin_memory=pin_memory,
         persistent_workers=(cfg.num_workers > 0),
         prefetch_factor=(cfg.prefetch_factor if cfg.num_workers > 0 else None),
+        pin_memory_device=(device.type if hasattr(torch.utils.data, 'DataLoader') else None),
     )
 
     device = torch.device(cfg.device)
@@ -280,8 +281,11 @@ def train_loop(cfg: TrainConfig) -> None:
         cache_dir=cfg.cache_dir,
         hsv_threshold=cfg.hsv_threshold,
         normalize_targets=False,
-        precompute=cfg.precompute,
+        precompute=False,  # avoid duplicate precompute; caches are already loaded by the first dataset
         backbone=backbone,
+        feature_batch_size=cfg.feature_batch_size,
+        precompute_workers=cfg.precompute_workers,
+        slic_backend=cfg.slic_backend,
     )
     val_sample_indices = [i for i, (img_idx, _k) in enumerate(ds_full_counts.index_map) if img_idx in val_image_set]
     ds_val_counts = torch.utils.data.Subset(ds_full_counts, val_sample_indices)
@@ -294,6 +298,7 @@ def train_loop(cfg: TrainConfig) -> None:
         pin_memory=pin_memory,
         persistent_workers=(cfg.num_workers > 0),
         prefetch_factor=(cfg.prefetch_factor if cfg.num_workers > 0 else None),
+        pin_memory_device=(device.type if hasattr(torch.utils.data, 'DataLoader') else None),
     )
 
     # Initialize logger
@@ -314,6 +319,10 @@ def train_loop(cfg: TrainConfig) -> None:
                 x = F.normalize(x, p=2, dim=1)
             edge_index = batch["edge_index"].to(device, non_blocking=True)
             y = batch["y"].to(device, non_blocking=True)
+
+            # Overlap H2D of next batch with compute of current batch when no AMP scaler sync
+            if hasattr(loader, "_iterator") and hasattr(torch.cuda, "synchronize") and device.type == "cuda":
+                torch.cuda.synchronize(device=None)
 
             with torch_autocast(device_type=device.type, enabled=(cfg.use_amp and device.type == "cuda")):
                 pred = model(x, edge_index)
