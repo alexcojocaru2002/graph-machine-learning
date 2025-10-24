@@ -59,14 +59,18 @@ class TrainConfig:
     cache_features: bool = True
     cache_dir: str = "artifacts/features"
     normalize_targets: bool = True
-    feature_device: str = "cpu"  # device for CNN feature extraction (cpu recommended)
+    feature_device: str = "cuda" if torch.cuda.is_available() else "cpu"
     precompute: bool = True
     hsv_threshold: float = 0.2
+    feature_batch_size: int = 8
+    precompute_workers: int = 0
+    slic_backend: str = "auto"
 
     # Loader
     batch_size: int = 1  # each graph is a sample; batching graphs of variable N kept as 1 for simplicity
     num_workers: int = 0
     shuffle: bool = True
+    prefetch_factor: int = 2
 
     # Split (deterministic train/val within train dir)
     val_fraction: float = 0.1
@@ -88,6 +92,9 @@ class TrainConfig:
     loss_type: str = "kl"  # mse | kl (paper uses soft targets + KL)
     use_wandb: bool = False
     eval_every_epochs: int = 5
+    compile_model: bool = False
+    compile_mode: str = "max-autotune"
+    compile_fullgraph: bool = False
 
     # Optim
     lr: float = 2e-4
@@ -160,6 +167,15 @@ def kl_loss_area(pred_logits: torch.Tensor, target_probs: torch.Tensor) -> torch
 
 
 def train_loop(cfg: TrainConfig) -> None:
+    # Backend tuning
+    try:
+        torch.backends.cudnn.benchmark = True
+    except Exception:
+        pass
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
     # Warm up VGG16 weights cache in the main process before DataLoader workers spawn
     try:
         _ = vgg16(weights=VGG16_Weights.IMAGENET1K_V1)
@@ -188,6 +204,9 @@ def train_loop(cfg: TrainConfig) -> None:
         normalize_targets=cfg.normalize_targets,
         precompute=cfg.precompute,
         backbone=backbone,
+        feature_batch_size=cfg.feature_batch_size,
+        precompute_workers=cfg.precompute_workers,
+        slic_backend=cfg.slic_backend,
     )
 
     # Deterministic split of images into train/val (val excluded from training)
@@ -215,6 +234,7 @@ def train_loop(cfg: TrainConfig) -> None:
         collate_fn=collate_graphs,
         pin_memory=pin_memory,
         persistent_workers=(cfg.num_workers > 0),
+        prefetch_factor=(cfg.prefetch_factor if cfg.num_workers > 0 else None),
     )
 
     device = torch.device(cfg.device)
@@ -230,7 +250,18 @@ def train_loop(cfg: TrainConfig) -> None:
         final_activation=final_act,
     ).to(device)
 
-    optimizer = optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    # Optional compile
+    try:
+        if cfg.compile_model and hasattr(torch, "compile"):
+            model = torch.compile(model, mode=cfg.compile_mode, fullgraph=bool(cfg.compile_fullgraph))
+    except Exception:
+        pass
+
+    # Use fused AdamW when available on CUDA
+    try:
+        optimizer = optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay, fused=(device.type == "cuda"))
+    except TypeError:
+        optimizer = optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
     scaler = TorchGradScaler(enabled=(cfg.use_amp and device.type == "cuda"))
 
     out_dir = Path(cfg.out_dir)
@@ -262,6 +293,7 @@ def train_loop(cfg: TrainConfig) -> None:
         collate_fn=collate_graphs,
         pin_memory=pin_memory,
         persistent_workers=(cfg.num_workers > 0),
+        prefetch_factor=(cfg.prefetch_factor if cfg.num_workers > 0 else None),
     )
 
     # Initialize logger
@@ -428,11 +460,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no_normalize_targets", action="store_true")
     p.add_argument("--feature_device", type=str, default=None)
     p.add_argument("--hsv_threshold", type=float, default=None)
+    p.add_argument("--feature_batch_size", type=int, default=None)
+    p.add_argument("--precompute_workers", type=int, default=None)
+    p.add_argument("--slic_backend", type=str, default=None, choices=["auto","cpu","cucim"])
 
     # Loader
     p.add_argument("--batch_size", type=int, default=None)
     p.add_argument("--num_workers", type=int, default=None)
     p.add_argument("--no_shuffle", action="store_true")
+    p.add_argument("--prefetch_factor", type=int, default=None)
 
     # Model
     p.add_argument("--in_dim", type=int, default=None)
@@ -444,6 +480,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--integrate_dropout", type=float, default=None)
     p.add_argument("--use_wandb", action="store_true")
     p.add_argument("--eval_every_epochs", type=int, default=None)
+    p.add_argument("--compile_model", action="store_true")
+    p.add_argument("--compile_mode", type=str, default=None)
+    p.add_argument("--compile_fullgraph", action="store_true")
 
     # Optim
     p.add_argument("--lr", type=float, default=None)
@@ -496,6 +535,20 @@ def merge_config(default: TrainConfig, yaml_cfg: dict, args: argparse.Namespace)
         cfg_dict["use_wandb"] = True
     if hasattr(args, "eval_every_epochs") and (args.eval_every_epochs is not None):
         cfg_dict["eval_every_epochs"] = int(args.eval_every_epochs)
+    if hasattr(args, "feature_batch_size") and (args.feature_batch_size is not None):
+        cfg_dict["feature_batch_size"] = int(args.feature_batch_size)
+    if hasattr(args, "precompute_workers") and (args.precompute_workers is not None):
+        cfg_dict["precompute_workers"] = int(args.precompute_workers)
+    if hasattr(args, "slic_backend") and (args.slic_backend is not None):
+        cfg_dict["slic_backend"] = str(args.slic_backend)
+    if hasattr(args, "prefetch_factor") and (args.prefetch_factor is not None):
+        cfg_dict["prefetch_factor"] = int(args.prefetch_factor)
+    if hasattr(args, "compile_model") and args.compile_model:
+        cfg_dict["compile_model"] = True
+    if hasattr(args, "compile_mode") and (args.compile_mode is not None):
+        cfg_dict["compile_mode"] = str(args.compile_mode)
+    if hasattr(args, "compile_fullgraph") and args.compile_fullgraph:
+        cfg_dict["compile_fullgraph"] = True
 
     # k_values may be provided as space-separated ints
     kv = cfg_dict.get("k_values")

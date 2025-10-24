@@ -1,4 +1,4 @@
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 import torch
 import torch.nn.functional as F
@@ -67,21 +67,8 @@ def extract_features(
     sp = slic(img_rgb, n_segments=k, compactness=10, start_label=0)  # [H,W]
     N = int(sp.max()) + 1
 
-    # Max over each superpixel region per channel
-    sp_t = torch.from_numpy(sp).to(device)
-    sp_flat = sp_t.reshape(-1)
-    C = Fcat.shape[0]
-    X = torch.full((N, C), -float("inf"), dtype=Fcat.dtype, device=device)
-    F_flat = Fcat.reshape(C, -1)
-    for c in range(C):
-        vals = F_flat[c]
-        # include_self=True preserves existing -inf for empty clusters
-        X[:, c].scatter_reduce_(0, sp_flat, vals, reduce='amax', include_self=True)
-
-    # Replace -inf (empty) with 0
-    X[~torch.isfinite(X)] = 0.0
-
-    return X.detach().to("cpu"), sp
+    X = _pool_from_feature_tensor_max(Fcat, sp, device=device)
+    return X, sp
 
 
 @torch.inference_mode()
@@ -134,15 +121,65 @@ def pool_from_backbone_maps_max(
     F4_up = F.interpolate(F4.unsqueeze(0), size=(H, W), mode="bilinear", align_corners=False)[0]
     F5_up = F.interpolate(F5.unsqueeze(0), size=(H, W), mode="bilinear", align_corners=False)[0]
     Fcat = torch.cat([F4_up, F5_up], dim=0)  # [1024,H,W]
+    return _pool_from_feature_tensor_max(Fcat, sp, device=device)
 
+
+@torch.inference_mode()
+def _pool_from_feature_tensor_max(
+    Fcat: torch.Tensor,  # [C, H, W]
+    sp: np.ndarray,      # [H, W]
+    device: str | torch.device = "cpu",
+) -> torch.Tensor:
+    """
+    Vectorized MAX pooling over superpixel regions without per-channel Python loops.
+    Returns X: FloatTensor [N, C] on CPU.
+    """
+    if isinstance(device, str):
+        device = torch.device(device)
+    C, H, W = Fcat.shape
     sp_t = torch.from_numpy(sp).to(device)
-    sp_flat = sp_t.reshape(-1)
-    C = Fcat.shape[0]
+    idx = sp_t.reshape(-1).long()  # [P]
+    P = int(idx.numel())
     N = int(sp.max()) + 1
-    X = torch.full((N, C), -float("inf"), dtype=Fcat.dtype, device=device)
-    F_flat = Fcat.reshape(C, -1)
-    for c in range(C):
-        vals = F_flat[c]
-        X[:, c].scatter_reduce_(0, sp_flat, vals, reduce='amax', include_self=True)
+    F_flat = Fcat.reshape(C, -1).transpose(0, 1)  # [P, C]
+    X = torch.full((N, C), -float("inf"), dtype=F_flat.dtype, device=device)
+    index = idx.unsqueeze(1).expand(P, C)
+    X.scatter_reduce_(0, index, F_flat, reduce='amax', include_self=True)
     X[~torch.isfinite(X)] = 0.0
     return X.detach().to("cpu")
+
+
+@torch.inference_mode()
+def compute_backbone_maps_vgg_batch(
+    imgs_t: List[torch.Tensor],
+    device: str | torch.device = "cpu",
+    backbone: Optional[torch.nn.Module] = None,
+    use_amp: bool = True,
+) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+    """
+    Batched VGG16 forward that returns lists of conv4_3 and conv5_3 feature maps on CPU.
+    Each element in the returned lists is a FloatTensor [512, h, w].
+    """
+    if len(imgs_t) == 0:
+        return [], []
+    if isinstance(device, str):
+        device = torch.device(device)
+    x = torch.stack([(t if t.ndim == 3 else t.squeeze(0)) for t in imgs_t], dim=0).to(device)
+    local_backbone = backbone
+    if local_backbone is None:
+        local_backbone = vgg16(weights=VGG16_Weights.IMAGENET1K_V1).features.to(device).eval()
+    feats4 = None
+    feats5 = None
+    with torch_autocast(device_type=str(device), enabled=(use_amp and device.type == "cuda")):
+        out = x
+        for i, layer in enumerate(local_backbone):
+            out = layer(out)
+            if i == 22:
+                feats4 = out  # [B,512,h4,w4]
+            if i == 29:
+                feats5 = out  # [B,512,h5,w5]
+                break
+    assert feats4 is not None and feats5 is not None
+    F4_list = [feats4[b].detach().to("cpu") for b in range(feats4.shape[0])]
+    F5_list = [feats5[b].detach().to("cpu") for b in range(feats5.shape[0])]
+    return F4_list, F5_list
