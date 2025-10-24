@@ -35,10 +35,13 @@ class EvalConfig:
     cache_dir: str = "artifacts/features"
     feature_device: str = "cuda" if torch.cuda.is_available() else "cpu"
     hsv_threshold: float = 0.2
+    feature_batch_size: int = 8
+    slic_backend: str = "auto"
 
     # Loader
     batch_size: int = 128
     num_workers: int = 4
+    prefetch_factor: int = 2
 
     # Model
     in_dim: int = 1024
@@ -76,6 +79,8 @@ def make_dataset(root: str, class_csv: str, img_size: Optional[Tuple[int, int]],
         precompute=True,
         backbone=backbone,
         hsv_threshold=hsv_threshold,
+        feature_batch_size=8,
+        slic_backend="auto",
     )
     return ds, names, class_rgb_values, unknown_index
 
@@ -525,6 +530,15 @@ def load_model(cfg: EvalConfig, num_classes_eff: int) -> SPNodeRegressor:
 
 
 def main(cfg: EvalConfig) -> None:
+    # Backend tuning for eval throughput
+    try:
+        torch.backends.cudnn.benchmark = True
+    except Exception:
+        pass
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
     # Shared backbone for all splits, built once
     backbone = vgg16(weights=VGG16_Weights.IMAGENET1K_V1).features.to(cfg.feature_device).eval()
     img_size = None
@@ -571,8 +585,8 @@ def main(cfg: EvalConfig) -> None:
 
     # DataLoaders
     pin_memory = (torch.device(cfg.device).type == "cuda")
-    valid_loader = DataLoader(ds_valid, batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers, collate_fn=collate_graphs, pin_memory=pin_memory, persistent_workers=(cfg.num_workers > 0))
-    test_loader = DataLoader(ds_test, batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers, collate_fn=collate_graphs, pin_memory=pin_memory, persistent_workers=(cfg.num_workers > 0))
+    valid_loader = DataLoader(ds_valid, batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers, collate_fn=collate_graphs, pin_memory=pin_memory, persistent_workers=(cfg.num_workers > 0), prefetch_factor=(cfg.prefetch_factor if cfg.num_workers > 0 else None))
+    test_loader = DataLoader(ds_test, batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers, collate_fn=collate_graphs, pin_memory=pin_memory, persistent_workers=(cfg.num_workers > 0), prefetch_factor=(cfg.prefetch_factor if cfg.num_workers > 0 else None))
 
     # Collect validation scores and calibrate thresholds on valid only (classification-style)
     y_score_val, y_true_val = collect_image_scores(model, valid_loader, cfg.normalize_node_features)
@@ -642,8 +656,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", type=str, default=None)
     p.add_argument("--num_workers", type=int, default=None)
     p.add_argument("--batch_size", type=int, default=None)
+    p.add_argument("--prefetch_factor", type=int, default=None)
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--hsv_threshold", type=float, default=None)
+    p.add_argument("--slic_backend", type=str, default=None, choices=["auto","cpu","cucim"])
     return p.parse_args()
 
 
@@ -663,8 +679,10 @@ if __name__ == "__main__":
     if args.device is not None: cfg.device = args.device
     if args.num_workers is not None: cfg.num_workers = args.num_workers
     if args.batch_size is not None: cfg.batch_size = args.batch_size
+    if args.prefetch_factor is not None: cfg.prefetch_factor = args.prefetch_factor
     if args.seed is not None: cfg.seed = args.seed
     if args.hsv_threshold is not None: cfg.hsv_threshold = args.hsv_threshold
+    if args.slic_backend is not None: cfg.slic_backend = args.slic_backend
     main(cfg)
 
 

@@ -15,9 +15,9 @@ from feature_extractor import (
     extract_features,
     compute_backbone_maps_vgg,
     pool_from_backbone_maps_max,
+    compute_backbone_maps_vgg_batch,
 )
-from utils.graph_utils import compute_edge_index_from_superpixels, compute_superpixel_area_targets
-from skimage.segmentation import slic
+from utils.graph_utils import compute_edge_index_from_superpixels, compute_superpixel_area_targets, slic_labels
 
 try:
     from tqdm import tqdm
@@ -58,6 +58,9 @@ class GraphSuperpixelDataset(Dataset):
         use_amp: bool = True,
         hsv_threshold: float = 0.2,
         backbone: Optional[torch.nn.Module] = None,
+        feature_batch_size: int = 8,
+        precompute_workers: int = 0,
+        slic_backend: str = "auto",
     ) -> None:
         super().__init__()
         self.base_ds = DeepGlobeDataset(str(data_dir), class_rgb_values, img_size=img_size)
@@ -81,6 +84,9 @@ class GraphSuperpixelDataset(Dataset):
             self.backbone_cache_dir = Path(cache_dir) / "backbone_maps"
         else:
             self.backbone_cache_dir = Path(backbone_cache_dir)
+        self.feature_batch_size = int(max(1, feature_batch_size))
+        self.precompute_workers = int(max(0, precompute_workers))
+        self.slic_backend = str(slic_backend)
 
         # Build index mapping from linear idx -> (image_idx, k)
         self.index_map: List[Tuple[int, int]] = []
@@ -97,6 +103,7 @@ class GraphSuperpixelDataset(Dataset):
 
         # Optional upfront precompute of all features and SLIC to avoid runtime overhead
         if self.cache_features and self.precompute_flag:
+            print(f"[GraphSuperpixelDataset] Starting precompute: images={len(self.base_ds)}, ks={list(self.k_values)}; feature_batch_size={self.feature_batch_size}")
             self.precompute()
 
     def __len__(self) -> int:
@@ -166,67 +173,68 @@ class GraphSuperpixelDataset(Dataset):
         sp: Optional[np.ndarray] = None
         feat_cache_path = self._features_cache_key(image_path, k, self.base_ds.img_size)
         if self.cache_features and feat_cache_path.exists():
-            data = np.load(feat_cache_path)
+            data = np.load(feat_cache_path, mmap_mode='r')
             X = torch.from_numpy(data["X"])  # [N, 1024]
             sp = data["sp"].astype(np.int64)
             edge_index = None  # adjacency cached separately
-        elif self.cache_features:
+        else:
             # Backward-compat: try legacy cache naming
-            legacy_path = self._legacy_features_cache_key(image_path, k, self.base_ds.img_size)
-            if legacy_path.exists():
-                try:
-                    data = np.load(legacy_path)
-                    X = torch.from_numpy(data["X"])  # [N,1024]
-                    sp = data["sp"].astype(np.int64)
-                    # Migrate to new cache key for future runs
+            if self.cache_features:
+                legacy_path = self._legacy_features_cache_key(image_path, k, self.base_ds.img_size)
+                if legacy_path.exists():
+                    try:
+                        data = np.load(legacy_path, mmap_mode='r')
+                        X = torch.from_numpy(data["X"])  # [N,1024]
+                        sp = data["sp"].astype(np.int64)
+                        # Migrate to new cache key for future runs
+                        try:
+                            self._atomic_savez(feat_cache_path, X=X.numpy(), sp=sp)
+                        except Exception:
+                            pass
+                    except Exception:
+                        X, sp = None, None
+            # If still missing, compute now and persist if caching enabled
+            if X is None or sp is None:
+                # Try to reuse cached backbone maps
+                F4 = None
+                F5 = None
+                if self.cache_features and self.cache_backbone_maps:
+                    bb_path = self._backbone_cache_key(image_path, self.base_ds.img_size)
+                    if bb_path.exists():
+                        try:
+                            bb = np.load(bb_path, mmap_mode='r')
+                            F4 = torch.from_numpy(bb["F4"])  # [512,h4,w4]
+                            F5 = torch.from_numpy(bb["F5"])  # [512,h5,w5]
+                        except Exception:
+                            F4, F5 = None, None
+                if (F4 is None) or (F5 is None):
+                    F4, F5 = compute_backbone_maps_vgg(img_t, device=self.feature_device, backbone=self.backbone, use_amp=self.use_amp)
+                    if self.cache_features and self.cache_backbone_maps:
+                        try:
+                            self._atomic_savez(self._backbone_cache_key(image_path, self.base_ds.img_size), F4=F4.numpy(), F5=F5.numpy())
+                        except Exception:
+                            pass
+                sp = slic_labels(
+                    img_rgb,
+                    n_segments=k,
+                    compactness=self.slic_compactness,
+                    sigma=self.slic_sigma,
+                    start_label=self.slic_start_label,
+                    backend=self.slic_backend,
+                )
+                X = pool_from_backbone_maps_max(F4, F5, sp, device=self.feature_device)
+                if self.cache_features:
                     try:
                         self._atomic_savez(feat_cache_path, X=X.numpy(), sp=sp)
                     except Exception:
                         pass
-                    # If legacy had adjacency, we'll migrate it below when we look for adj cache
-                except Exception:
-                    X, sp = None, None
-        else:
-            # Compute now (slower). Prefer calling precompute() once to populate cache.
-            # Try to reuse cached backbone maps
-            use_cached_backbone = False
-            if self.cache_features and self.cache_backbone_maps:
-                bb_path = self._backbone_cache_key(image_path, self.base_ds.img_size)
-                if bb_path.exists():
-                    try:
-                        bb = np.load(bb_path)
-                        F4 = torch.from_numpy(bb["F4"])  # [512,h4,w4]
-                        F5 = torch.from_numpy(bb["F5"])  # [512,h5,w5]
-                        use_cached_backbone = True
-                    except Exception:
-                        pass
-            if not use_cached_backbone:
-                F4, F5 = compute_backbone_maps_vgg(img_t, device=self.feature_device, backbone=self.backbone, use_amp=self.use_amp)
-                if self.cache_features and self.cache_backbone_maps:
-                    try:
-                        self._atomic_savez(self._backbone_cache_key(image_path, self.base_ds.img_size), F4=F4.numpy(), F5=F5.numpy())
-                    except Exception:
-                        pass
-            sp = slic(
-                img_rgb,
-                n_segments=k,
-                compactness=self.slic_compactness,
-                sigma=self.slic_sigma,
-                start_label=self.slic_start_label,
-            )
-            X = pool_from_backbone_maps_max(F4, F5, sp, device=self.feature_device)
-            if self.cache_features:
-                try:
-                    self._atomic_savez(feat_cache_path, X=X.numpy(), sp=sp)
-                except Exception:
-                    pass
 
         # Adjacency graph
         # Adjacency graph (cached separately by hsv_threshold)
         adj_cache_path = self._adj_cache_key(image_path, k, self.base_ds.img_size, self.hsv_threshold)
         if self.cache_features and adj_cache_path.exists():
             try:
-                adj = np.load(adj_cache_path)
+                adj = np.load(adj_cache_path, mmap_mode='r')
                 edge_index = torch.from_numpy(adj["edge_index"]).long()
             except Exception:
                 edge_index = None
@@ -237,7 +245,7 @@ class GraphSuperpixelDataset(Dataset):
                 try:
                     legacy_path = self._legacy_features_cache_key(image_path, k, self.base_ds.img_size)
                     if legacy_path.exists():
-                        data = np.load(legacy_path)
+                        data = np.load(legacy_path, mmap_mode='r')
                         if "edge_index" in data.files:
                             edge_index = torch.from_numpy(data["edge_index"]).long()
                             try:
@@ -290,26 +298,56 @@ class GraphSuperpixelDataset(Dataset):
         """
         if not self.cache_features:
             return
-        iterator = range(len(self.base_ds))
-        if tqdm is not None:
-            iterator = tqdm(iterator, desc="Precompute CNN+SLIC")
 
-        # Reuse one backbone instance if provided; otherwise lazily instantiate once here
+        # Ensure backbone is ready on feature_device
         if self.backbone is None:
             from torchvision.models import vgg16, VGG16_Weights
             self.backbone = vgg16(weights=VGG16_Weights.IMAGENET1K_V1).features.to(self.feature_device).eval()
 
-        for i in iterator:
+        num_images = len(self.base_ds)
+        indices = list(range(num_images))
+        rng = range(0, num_images, self.feature_batch_size)
+        if tqdm is not None:
+            rng = tqdm(rng, desc="Precompute CNN backbone (batched)")
+
+        # 1) Batched backbone forward for images missing backbone cache
+        for start in rng:
+            end = min(start + self.feature_batch_size, num_images)
+            batch_idx = []
+            imgs_t: List[torch.Tensor] = []
+            for i in range(start, end):
+                image_path = self.base_ds.image_paths[i]
+                bb_path = self._backbone_cache_key(image_path, self.base_ds.img_size)
+                if self.cache_backbone_maps and bb_path.exists():
+                    continue
+                img_t, _img_rgb, _ = self.base_ds[i]
+                batch_idx.append(i)
+                imgs_t.append(img_t)
+            if len(batch_idx) == 0:
+                continue
+            F4_list, F5_list = compute_backbone_maps_vgg_batch(imgs_t, device=self.feature_device, backbone=self.backbone, use_amp=self.use_amp)
+            for i, F4, F5 in zip(batch_idx, F4_list, F5_list):
+                image_path = self.base_ds.image_paths[i]
+                try:
+                    self._atomic_savez(self._backbone_cache_key(image_path, self.base_ds.img_size), F4=F4.numpy(), F5=F5.numpy())
+                except Exception:
+                    pass
+
+        # 2) For each image and k, compute SLIC + pooled features and adjacency if missing
+        it2 = range(num_images)
+        if tqdm is not None:
+            it2 = tqdm(it2, desc="Precompute SLIC+pool+adj")
+        for i in it2:
             img_t, img_rgb, _ = self.base_ds[i]
             image_path = self.base_ds.image_paths[i]
-            # Load or compute backbone feature maps once per image
+            # Load backbone maps (should exist now)
             F4: Optional[torch.Tensor] = None
             F5: Optional[torch.Tensor] = None
             if self.cache_backbone_maps:
                 bb_path = self._backbone_cache_key(image_path, self.base_ds.img_size)
                 if bb_path.exists():
                     try:
-                        bb = np.load(bb_path)
+                        bb = np.load(bb_path, mmap_mode='r')
                         F4 = torch.from_numpy(bb["F4"])  # [512,h4,w4]
                         F5 = torch.from_numpy(bb["F5"])  # [512,h5,w5]
                     except Exception:
@@ -321,39 +359,59 @@ class GraphSuperpixelDataset(Dataset):
                         self._atomic_savez(self._backbone_cache_key(image_path, self.base_ds.img_size), F4=F4.numpy(), F5=F5.numpy())
                     except Exception:
                         pass
-            # For each k, compute SLIC and pooled features if not cached
+
             for k in self.k_values:
                 feat_cache_path = self._features_cache_key(image_path, k, self.base_ds.img_size)
+                need_features = True
                 if feat_cache_path.exists():
-                    # Skip if X/sp already exist in cache
                     try:
-                        data = np.load(feat_cache_path)
+                        data = np.load(feat_cache_path, mmap_mode='r')
                         if ("X" in data) and ("sp" in data):
-                            continue
+                            need_features = False
+                    except Exception:
+                        need_features = True
+                if need_features:
+                    sp = slic_labels(
+                        img_rgb,
+                        n_segments=k,
+                        compactness=self.slic_compactness,
+                        sigma=self.slic_sigma,
+                        start_label=self.slic_start_label,
+                        backend=self.slic_backend,
+                    )
+                    X = pool_from_backbone_maps_max(F4, F5, sp, device=self.feature_device)
+                    try:
+                        self._atomic_savez(feat_cache_path, X=X.numpy(), sp=sp)
                     except Exception:
                         pass
-                else:
-                    # If legacy exists, migrate and skip
-                    legacy_path = self._legacy_features_cache_key(image_path, k, self.base_ds.img_size)
-                    if legacy_path.exists():
-                        try:
-                            data = np.load(legacy_path)
-                            if ("X" in data) and ("sp" in data):
-                                self._atomic_savez(feat_cache_path, X=data["X"], sp=data["sp"])
-                                continue
-                        except Exception:
-                            pass
-                sp = slic(
-                    img_rgb,
-                    n_segments=k,
-                    compactness=self.slic_compactness,
-                    sigma=self.slic_sigma,
-                    start_label=self.slic_start_label,
-                )
-                X = pool_from_backbone_maps_max(F4, F5, sp, device=self.feature_device)
-                try:
-                    self._atomic_savez(feat_cache_path, X=X.numpy(), sp=sp)
-                except Exception:
-                    pass
+
+                # Precompute adjacency per (image,k,threshold)
+                adj_cache_path = self._adj_cache_key(image_path, k, self.base_ds.img_size, self.hsv_threshold)
+                if not adj_cache_path.exists():
+                    # Load sp from features cache to avoid recompute
+                    try:
+                        data = np.load(feat_cache_path, mmap_mode='r')
+                        sp = data["sp"].astype(np.int64)
+                    except Exception:
+                        # Fallback recompute
+                        sp = slic_labels(
+                            img_rgb,
+                            n_segments=k,
+                            compactness=self.slic_compactness,
+                            sigma=self.slic_sigma,
+                            start_label=self.slic_start_label,
+                            backend=self.slic_backend,
+                        )
+                    edge_index = compute_edge_index_from_superpixels(
+                        sp,
+                        connectivity=8,
+                        rgb=img_rgb,
+                        hsv_threshold=self.hsv_threshold,
+                        add_self_loops=True,
+                    )
+                    try:
+                        self._atomic_savez(adj_cache_path, edge_index=edge_index.numpy())
+                    except Exception:
+                        pass
 
 

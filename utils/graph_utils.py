@@ -5,6 +5,14 @@ from typing import Optional, Tuple
 import numpy as np
 import torch
 from skimage.color import rgb2hsv
+from typing import Optional
+
+try:
+    # Optional GPU SLIC via cuCIM, API similar to skimage
+    from cucim.skimage.segmentation import slic as cucim_slic  # type: ignore
+    _HAS_CUCIM = True
+except Exception:
+    _HAS_CUCIM = False
 
 
 def compute_edge_index_from_superpixels(
@@ -26,47 +34,59 @@ def compute_edge_index_from_superpixels(
     max_id = int(sp.max())
     N = max_id + 1
 
-    neighbors = set()
-
-    # 4-connectivity (right and down to avoid duplicates; we'll add symmetric edges later)
+    # Build adjacency pairs vectorized
+    pairs = []
+    # 4-connectivity
     right_diff = sp[:, :-1] != sp[:, 1:]
     ys, xs = np.where(right_diff)
-    for y, x in zip(ys, xs):
-        a, b = int(sp[y, x]), int(sp[y, x + 1])
-        neighbors.add((a, b))
-        neighbors.add((b, a))
+    if ys.size:
+        a = sp[ys, xs]
+        b = sp[ys, xs + 1]
+        pairs.append(np.stack([a, b], axis=1))
+        pairs.append(np.stack([b, a], axis=1))
 
     down_diff = sp[:-1, :] != sp[1:, :]
     ys, xs = np.where(down_diff)
-    for y, x in zip(ys, xs):
-        a, b = int(sp[y, x]), int(sp[y + 1, x])
-        neighbors.add((a, b))
-        neighbors.add((b, a))
+    if ys.size:
+        a = sp[ys, xs]
+        b = sp[ys + 1, xs]
+        pairs.append(np.stack([a, b], axis=1))
+        pairs.append(np.stack([b, a], axis=1))
 
     if connectivity == 8:
-        # Diagonals
         diag1_diff = sp[:-1, :-1] != sp[1:, 1:]
         ys, xs = np.where(diag1_diff)
-        for y, x in zip(ys, xs):
-            a, b = int(sp[y, x]), int(sp[y + 1, x + 1])
-            neighbors.add((a, b))
-            neighbors.add((b, a))
+        if ys.size:
+            a = sp[ys, xs]
+            b = sp[ys + 1, xs + 1]
+            pairs.append(np.stack([a, b], axis=1))
+            pairs.append(np.stack([b, a], axis=1))
 
         diag2_diff = sp[:-1, 1:] != sp[1:, :-1]
         ys, xs = np.where(diag2_diff)
-        for y, x in zip(ys, xs):
-            a, b = int(sp[y, x + 1]), int(sp[y + 1, x])
-            neighbors.add((a, b))
-            neighbors.add((b, a))
+        if ys.size:
+            a = sp[ys, xs + 1]
+            b = sp[ys + 1, xs]
+            pairs.append(np.stack([a, b], axis=1))
+            pairs.append(np.stack([b, a], axis=1))
+
+    if len(pairs) == 0:
+        base_pairs = np.empty((0, 2), dtype=np.int64)
+    else:
+        base_pairs = np.concatenate(pairs, axis=0).astype(np.int64)
+        # Remove self duplicates from this stage; we'll add explicit self-loops later if requested
+        # Also unique the edges to shrink work for HSV filtering
+        if base_pairs.size:
+            base_pairs = np.unique(base_pairs, axis=0)
 
     # Optional HSV similarity filtering
-    if hsv_threshold is not None and rgb is not None:
+    neighbors = base_pairs
+
+    if hsv_threshold is not None and rgb is not None and neighbors.size:
         hsv = rgb2hsv(rgb.astype(np.float32) / 255.0)
-        # Vectorized mean HSV per region using bincount
         flat_ids = sp.reshape(-1).astype(np.int64)
         hsv_flat = hsv.reshape(-1, 3).astype(np.float32)
         counts = np.bincount(flat_ids, minlength=N).astype(np.int64)
-        # Avoid division by zero
         counts_safe = counts.copy()
         counts_safe[counts_safe == 0] = 1
         sums = np.stack([
@@ -76,27 +96,73 @@ def compute_edge_index_from_superpixels(
         ], axis=1).astype(np.float32)
         means = sums / counts_safe[:, None]
 
-        filtered = set()
-        t = float(hsv_threshold)
-        for (a, b) in neighbors:
-            if a == b:
-                filtered.add((a, b))
-                continue
-            dv = means[a] - means[b]
-            dist = float(np.sqrt(np.sum(dv * dv)))
-            if dist <= t:
-                filtered.add((a, b))
-        neighbors = filtered
+        a_idx = neighbors[:, 0]
+        b_idx = neighbors[:, 1]
+        dv = means[a_idx] - means[b_idx]
+        dist = np.sqrt(np.sum(dv * dv, axis=1))
+        mask = (dist <= float(hsv_threshold)) | (a_idx == b_idx)
+        neighbors = neighbors[mask]
 
     if add_self_loops:
-        for i in range(N):
-            neighbors.add((i, i))
+        diag = np.arange(N, dtype=np.int64)
+        self_loops = np.stack([diag, diag], axis=1)
+        if neighbors.size:
+            neighbors = np.concatenate([neighbors, self_loops], axis=0)
+        else:
+            neighbors = self_loops
 
-    if len(neighbors) == 0:
+    if neighbors.size == 0:
         return torch.zeros((2, 0), dtype=torch.long)
 
-    edge_index = torch.tensor(list(neighbors), dtype=torch.long).T  # [2, E]
+    # Unique one last time to avoid duplicates
+    neighbors = np.unique(neighbors, axis=0)
+    edge_index = torch.from_numpy(neighbors.T.astype(np.int64))  # [2, E]
     return edge_index
+
+
+def slic_labels(
+    img_rgb: np.ndarray,
+    n_segments: int,
+    compactness: float,
+    sigma: float,
+    start_label: int,
+    backend: str = "auto",
+) -> np.ndarray:
+    """
+    Compute SLIC superpixels with selectable backend. Returns labels [H,W] int64 starting at start_label.
+    backends: 'cpu' (skimage), 'cucim' (GPU via cuCIM), 'auto' (prefer cucim when available)
+    """
+    if backend not in ("cpu", "cucim", "auto"):
+        backend = "auto"
+    if backend in ("cucim", "auto") and _HAS_CUCIM:
+        try:
+            # cuCIM aims for skimage API compatibility
+            labels = cucim_slic(
+                img_rgb,
+                n_segments=int(n_segments),
+                compactness=float(compactness),
+                sigma=float(sigma),
+                start_label=int(start_label),
+                channel_axis=-1,
+            )
+            # Ensure numpy on CPU, contiguous int64
+            if hasattr(labels, "get"):
+                labels = labels.get()
+            labels = np.asarray(labels)
+            return labels.astype(np.int64, copy=False)
+        except Exception:
+            # Fallback to CPU implementation
+            pass
+    # CPU skimage fallback
+    from skimage.segmentation import slic as sk_slic
+    labels = sk_slic(
+        img_rgb,
+        n_segments=int(n_segments),
+        compactness=float(compactness),
+        sigma=float(sigma),
+        start_label=int(start_label),
+    )
+    return labels.astype(np.int64, copy=False)
 
 
 def compute_superpixel_area_targets(
