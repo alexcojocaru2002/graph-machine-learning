@@ -36,7 +36,7 @@ class EvalConfig:
     feature_device: str = "cuda" if torch.cuda.is_available() else "cpu"
     hsv_threshold: float = 0.2
     feature_batch_size: int = 8
-    slic_backend: str = "auto"
+    slic_backend: str = "cpu"
 
     # Loader
     batch_size: int = 128
@@ -659,7 +659,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--prefetch_factor", type=int, default=None)
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--hsv_threshold", type=float, default=None)
-    p.add_argument("--slic_backend", type=str, default=None, choices=["auto","cpu","cucim"])
+    p.add_argument("--slic_backend", type=str, default=None, choices=["cpu"])  # fixed to skimage
     return p.parse_args()
 
 
