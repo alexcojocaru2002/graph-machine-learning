@@ -64,7 +64,7 @@ class TrainConfig:
     hsv_threshold: float = 0.2
     feature_batch_size: int = 8
     precompute_workers: int = 0
-    slic_backend: str = "auto"
+    slic_backend: str = "cpu"
 
     # Loader
     batch_size: int = 1  # each graph is a sample; batching graphs of variable N kept as 1 for simplicity
@@ -462,7 +462,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--hsv_threshold", type=float, default=None)
     p.add_argument("--feature_batch_size", type=int, default=None)
     p.add_argument("--precompute_workers", type=int, default=None)
-    p.add_argument("--slic_backend", type=str, default=None, choices=["auto","cpu","cucim"])
+    p.add_argument("--slic_backend", type=str, default=None, choices=["cpu"])  # fixed to skimage
 
     # Loader
     p.add_argument("--batch_size", type=int, default=None)

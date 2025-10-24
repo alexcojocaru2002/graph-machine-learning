@@ -7,13 +7,6 @@ import torch
 from skimage.color import rgb2hsv
 from typing import Optional
 
-try:
-    # Optional GPU SLIC via cuCIM, API similar to skimage
-    from cucim.skimage.segmentation import slic as cucim_slic  # type: ignore
-    _HAS_CUCIM = True
-except Exception:
-    _HAS_CUCIM = False
-
 
 def compute_edge_index_from_superpixels(
     sp: np.ndarray,
@@ -126,34 +119,10 @@ def slic_labels(
     compactness: float,
     sigma: float,
     start_label: int,
-    backend: str = "auto",
 ) -> np.ndarray:
     """
-    Compute SLIC superpixels with selectable backend. Returns labels [H,W] int64 starting at start_label.
-    backends: 'cpu' (skimage), 'cucim' (GPU via cuCIM), 'auto' (prefer cucim when available)
+    Compute SLIC superpixels using scikit-image. Returns labels [H,W] int64 starting at start_label.
     """
-    if backend not in ("cpu", "cucim", "auto"):
-        backend = "auto"
-    if backend in ("cucim", "auto") and _HAS_CUCIM:
-        try:
-            # cuCIM aims for skimage API compatibility
-            labels = cucim_slic(
-                img_rgb,
-                n_segments=int(n_segments),
-                compactness=float(compactness),
-                sigma=float(sigma),
-                start_label=int(start_label),
-                channel_axis=-1,
-            )
-            # Ensure numpy on CPU, contiguous int64
-            if hasattr(labels, "get"):
-                labels = labels.get()
-            labels = np.asarray(labels)
-            return labels.astype(np.int64, copy=False)
-        except Exception:
-            # Fallback to CPU implementation
-            pass
-    # CPU skimage fallback
     from skimage.segmentation import slic as sk_slic
     labels = sk_slic(
         img_rgb,

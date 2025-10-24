@@ -60,7 +60,7 @@ class GraphSuperpixelDataset(Dataset):
         backbone: Optional[torch.nn.Module] = None,
         feature_batch_size: int = 8,
         precompute_workers: int = 0,
-        slic_backend: str = "auto",
+        slic_backend: str = "cpu",
     ) -> None:
         super().__init__()
         self.base_ds = DeepGlobeDataset(str(data_dir), class_rgb_values, img_size=img_size)
@@ -87,7 +87,19 @@ class GraphSuperpixelDataset(Dataset):
             self.backbone_cache_dir = Path(backbone_cache_dir)
         self.feature_batch_size = int(max(1, feature_batch_size))
         self.precompute_workers = int(max(0, precompute_workers))
-        self.slic_backend = str(slic_backend)
+        # Backend is fixed to CPU (skimage)
+        self.slic_backend = "cpu"
+
+        # In-memory global caches shared across dataset instances in this process
+        global _GLOBAL_FEATURES, _GLOBAL_ADJ
+        try:
+            _GLOBAL_FEATURES
+        except NameError:
+            _GLOBAL_FEATURES = {}
+        try:
+            _GLOBAL_ADJ
+        except NameError:
+            _GLOBAL_ADJ = {}
 
         # Build index mapping from linear idx -> (image_idx, k)
         self.index_map: List[Tuple[int, int]] = []
@@ -169,11 +181,16 @@ class GraphSuperpixelDataset(Dataset):
         image_path = self.base_ds.image_paths[image_idx]
         mask_path = self.base_ds.mask_paths[image_idx]
 
-        # Try cache
+        # Try in-memory cache first
         X: Optional[torch.Tensor] = None
         sp: Optional[np.ndarray] = None
+        gkey_feat = (image_path, int(k))
+        global _GLOBAL_FEATURES
+        if gkey_feat in _GLOBAL_FEATURES:
+            X, sp = _GLOBAL_FEATURES[gkey_feat]
+        # Disk cache if needed
         feat_cache_path = self._features_cache_key(image_path, k, self.base_ds.img_size)
-        if feat_cache_path.exists():
+        if (X is None or sp is None) and feat_cache_path.exists():
             data = np.load(feat_cache_path, mmap_mode='r')
             X = torch.from_numpy(data["X"])  # [N, 1024]
             sp = data["sp"].astype(np.int64)
@@ -227,11 +244,18 @@ class GraphSuperpixelDataset(Dataset):
                     self._atomic_savez(feat_cache_path, X=X.numpy(), sp=sp)
                 except Exception:
                     pass
+        # Populate global memory cache
+        _GLOBAL_FEATURES[gkey_feat] = (X, sp)
 
         # Adjacency graph
         # Adjacency graph (cached separately by hsv_threshold)
         adj_cache_path = self._adj_cache_key(image_path, k, self.base_ds.img_size, self.hsv_threshold)
-        if adj_cache_path.exists():
+        # Try in-memory adjacency cache first
+        gkey_adj = (image_path, int(k), float(self.hsv_threshold))
+        global _GLOBAL_ADJ
+        if gkey_adj in _GLOBAL_ADJ:
+            edge_index = _GLOBAL_ADJ[gkey_adj]
+        elif adj_cache_path.exists():
             try:
                 adj = np.load(adj_cache_path, mmap_mode='r')
                 edge_index = torch.from_numpy(adj["edge_index"]).long()
@@ -264,6 +288,8 @@ class GraphSuperpixelDataset(Dataset):
                 self._atomic_savez(adj_cache_path, edge_index=edge_index.numpy())
             except Exception:
                 pass
+        # Populate in-memory adjacency cache
+        _GLOBAL_ADJ[gkey_adj] = edge_index
 
         # Targets from mask
         mask_np = mask_t.numpy().astype(np.int64)
@@ -329,7 +355,7 @@ class GraphSuperpixelDataset(Dataset):
                 except Exception:
                     pass
 
-        # 2) For each image and k, compute SLIC + pooled features and adjacency if missing
+        # 2) For each image and k, compute or LOAD SLIC + pooled features and adjacency into in-memory caches
         it2 = range(num_images)
         if tqdm is not None:
             it2 = tqdm(it2, desc="Precompute SLIC+pool+adj")
@@ -358,22 +384,30 @@ class GraphSuperpixelDataset(Dataset):
 
             for k in self.k_values:
                 feat_cache_path = self._features_cache_key(image_path, k, self.base_ds.img_size)
-                need_features = True
-                if feat_cache_path.exists():
-                    try:
+                # Load cached features if available, else compute then save
+                try:
+                    if feat_cache_path.exists():
                         data = np.load(feat_cache_path, mmap_mode='r')
-                        if ("X" in data) and ("sp" in data):
-                            need_features = False
-                    except Exception:
-                        need_features = True
-                if need_features:
+                        sp = data["sp"].astype(np.int64)
+                        X = torch.from_numpy(data["X"])  # [N, 1024]
+                    else:
+                        sp = slic_labels(
+                            img_rgb,
+                            n_segments=k,
+                            compactness=self.slic_compactness,
+                            sigma=self.slic_sigma,
+                            start_label=self.slic_start_label,
+                        )
+                        X = pool_from_backbone_maps_max(F4, F5, sp, device=self.feature_device)
+                        self._atomic_savez(feat_cache_path, X=X.numpy(), sp=sp)
+                except Exception:
+                    # As a fallback, recompute and try to persist
                     sp = slic_labels(
                         img_rgb,
                         n_segments=k,
                         compactness=self.slic_compactness,
                         sigma=self.slic_sigma,
                         start_label=self.slic_start_label,
-                        backend=self.slic_backend,
                     )
                     X = pool_from_backbone_maps_max(F4, F5, sp, device=self.feature_device)
                     try:
@@ -381,23 +415,27 @@ class GraphSuperpixelDataset(Dataset):
                     except Exception:
                         pass
 
+                # Store in-process cache for dataloader fast path
+                global _GLOBAL_FEATURES
+                _GLOBAL_FEATURES[(image_path, int(k))] = (X, sp)
+
                 # Precompute adjacency per (image,k,threshold)
                 adj_cache_path = self._adj_cache_key(image_path, k, self.base_ds.img_size, self.hsv_threshold)
-                if not adj_cache_path.exists():
-                    # Load sp from features cache to avoid recompute
-                    try:
-                        data = np.load(feat_cache_path, mmap_mode='r')
-                        sp = data["sp"].astype(np.int64)
-                    except Exception:
-                        # Fallback recompute
-                        sp = slic_labels(
-                            img_rgb,
-                            n_segments=k,
-                            compactness=self.slic_compactness,
-                            sigma=self.slic_sigma,
-                            start_label=self.slic_start_label,
-                            backend=self.slic_backend,
+                # Load adjacency if available, else compute then save
+                try:
+                    if adj_cache_path.exists():
+                        adj = np.load(adj_cache_path, mmap_mode='r')
+                        edge_index = torch.from_numpy(adj["edge_index"]).long()
+                    else:
+                        edge_index = compute_edge_index_from_superpixels(
+                            sp,
+                            connectivity=8,
+                            rgb=img_rgb,
+                            hsv_threshold=self.hsv_threshold,
+                            add_self_loops=True,
                         )
+                        self._atomic_savez(adj_cache_path, edge_index=edge_index.numpy())
+                except Exception:
                     edge_index = compute_edge_index_from_superpixels(
                         sp,
                         connectivity=8,
@@ -409,5 +447,9 @@ class GraphSuperpixelDataset(Dataset):
                         self._atomic_savez(adj_cache_path, edge_index=edge_index.numpy())
                     except Exception:
                         pass
+
+                # Store in-process adjacency cache
+                global _GLOBAL_ADJ
+                _GLOBAL_ADJ[(image_path, int(k), float(self.hsv_threshold))] = edge_index
 
 
