@@ -388,6 +388,14 @@ def train_loop(cfg: TrainConfig) -> None:
             json.dump(meta, f, indent=2)
         print(f"Saved checkpoint: {ckpt_path}")
 
+        # Upload artifacts to Weights & Biases when enabled
+        if cfg.use_wandb:
+            try:
+                logger.log_artifact(ckpt_path, name=f"ckpt_epoch_{epoch:03d}.pt", type="checkpoint")
+                logger.log_artifact(ckpt_path.with_suffix('.json'), name=f"ckpt_meta_epoch_{epoch:03d}.json", type="metadata")
+            except Exception:
+                pass
+
         # Epoch-level logging
         if cfg.use_wandb:
             avg_loss = running / max(1, (i + 1))

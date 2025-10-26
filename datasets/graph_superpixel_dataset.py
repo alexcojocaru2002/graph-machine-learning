@@ -24,6 +24,10 @@ try:
 except Exception:
     tqdm = None
 
+# Process-local caches for features and adjacency (available to DataLoader workers)
+_GLOBAL_FEATURES = {}
+_GLOBAL_ADJ = {}
+
 
 class GraphSuperpixelDataset(Dataset):
     """
