@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Any, Dict, Optional
+from pathlib import Path
 
 
 class TrainLogger:
@@ -35,5 +36,21 @@ class TrainLogger:
             except Exception:
                 pass
         self._active = False
+
+    def log_artifact(self, file_path: str | Path, name: Optional[str] = None, type: str = "artifact") -> None:
+        if not (self._active and (self._wandb is not None)):
+            return
+        try:
+            p = Path(file_path)
+            artifact_name = name or p.name
+            art = self._wandb.Artifact(artifact_name, type=type)
+            art.add_file(str(p))
+            self._wandb.log_artifact(art)
+        except Exception:
+            # Fallback to simple file save if artifact fails
+            try:
+                self._wandb.save(str(file_path))
+            except Exception:
+                pass
 
 
