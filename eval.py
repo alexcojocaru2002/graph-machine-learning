@@ -10,6 +10,10 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvision.models import vgg16, VGG16_Weights
+import os
+import random
+import matplotlib
+import matplotlib.pyplot as plt
 
 from load_palette import load_class_palette
 from datasets.graph_superpixel_dataset import GraphSuperpixelDataset
@@ -39,8 +43,8 @@ class EvalConfig:
     slic_backend: str = "cpu"
 
     # Loader
-    batch_size: int = 128
-    num_workers: int = 4
+    batch_size: int = 16
+    num_workers: int = 2
     prefetch_factor: int = 2
 
     # Model
@@ -54,9 +58,18 @@ class EvalConfig:
 
     # Device
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    seed: int = 42
 
     # Checkpoint
     ckpt_path: Optional[str] = None
+    ckpt2_path: Optional[str] = None
+
+    # Plotting
+    plot_sample: bool = False
+    plot_k: Optional[int] = None
+    save_plots_dir: str = "artifacts/plots"
+    no_show: bool = True
+    plot_image: Optional[str] = None  # image stem or index to use for plotting
 
 
 def collate_graphs(batch):
@@ -76,7 +89,7 @@ def make_dataset(root: str, class_csv: str, img_size: Optional[Tuple[int, int]],
         cache_features=True,
         cache_dir=cache_dir,
         normalize_targets=normalize_targets,
-        precompute=True,
+        precompute=False,
         backbone=backbone,
         hsv_threshold=hsv_threshold,
         feature_batch_size=8,
@@ -529,6 +542,325 @@ def load_model(cfg: EvalConfig, num_classes_eff: int) -> SPNodeRegressor:
     return model
 
 
+def _mask_idx_to_rgb(mask_idx: np.ndarray, class_rgb_values: List[Tuple[int, int, int]]) -> np.ndarray:
+    H, W = mask_idx.shape
+    out = np.zeros((H, W, 3), dtype=np.uint8)
+    for idx, (r, g, b) in enumerate(class_rgb_values):
+        out[mask_idx == idx] = (r, g, b)
+    return out
+
+
+def _effective_palette(class_rgb_values: List[Tuple[int, int, int]], unknown_index: Optional[int]) -> List[Tuple[int, int, int]]:
+    if unknown_index is None or unknown_index < 0 or unknown_index >= len(class_rgb_values):
+        return list(class_rgb_values)
+    return [c for i, c in enumerate(class_rgb_values) if i != unknown_index]
+
+
+def _plot_random_sample_for_k(
+    ds_full: GraphSuperpixelDataset,
+    model_list: List[SPNodeRegressor],
+    model_labels: List[str],
+    names: List[str],
+    class_rgb_values: List[Tuple[int, int, int]],
+    unknown_index: Optional[int],
+    k_value: int,
+    normalize_node_features: bool,
+    device: torch.device,
+    save_dir: str,
+    show: bool,
+    image_index: Optional[int] = None,
+) -> None:
+    # Choose a random image from the base dataset
+    if image_index is None:
+        rng = random.Random()
+        img_idx = rng.randrange(len(ds_full.base_ds))
+    else:
+        img_idx = int(max(0, min(len(ds_full.base_ds) - 1, image_index)))
+    # Find the linear index for (img_idx, k_value)
+    sample_idx = None
+    for i, (im_i, k) in enumerate(ds_full.index_map):
+        if im_i == img_idx and int(k) == int(k_value):
+            sample_idx = i
+            break
+    if sample_idx is None:
+        print(f"[plot] Could not find sample for chosen image and k={k_value}")
+        return
+
+    sample = ds_full[sample_idx]
+    x = sample["x"].to(device)
+    if normalize_node_features:
+        x = F.normalize(x, p=2, dim=1)
+    edge_index = sample["edge_index"].to(device)
+
+    # Load image and mask RGB
+    img_t, img_rgb, mask_t = ds_full.base_ds[img_idx]
+    mask_idx = mask_t.numpy().astype(np.int64)
+    mask_rgb = _mask_idx_to_rgb(mask_idx, class_rgb_values)
+
+    # Load superpixel map from cache (fast path)
+    img_path = sample["meta"]["image_path"]
+    k = int(sample["meta"]["k"])
+    x_path, sp_path = ds_full._features_cache_paths_npy(img_path, k, ds_full.base_ds.img_size)  # type: ignore[attr-defined]
+    if sp_path.exists():
+        sp = np.load(sp_path, mmap_mode='r').astype(np.int64)
+    else:
+        # Fallback: recompute SLIC if cache missing
+        from utils.graph_utils import slic_labels
+        sp = slic_labels(img_rgb, n_segments=k, compactness=ds_full.slic_compactness, sigma=ds_full.slic_sigma, start_label=ds_full.slic_start_label)
+
+    # Model predictions per node -> per-pixel map via superpixels
+    eff_palette = _effective_palette(class_rgb_values, unknown_index)
+    pred_rgbs: List[np.ndarray] = []
+    for model in model_list:
+        with torch.inference_mode():
+            logits = model(x, edge_index)
+            pred_cls = torch.argmax(logits, dim=-1).detach().cpu().numpy()  # [N]
+        # Map node class to pixels
+        H, W = sp.shape
+        pred_rgb = np.zeros((H, W, 3), dtype=np.uint8)
+        # Note: pred class indices correspond to effective palette (unknown removed)
+        for node_id in range(pred_cls.shape[0]):
+            c = int(pred_cls[node_id])
+            if c < 0 or c >= len(eff_palette):
+                color = (0, 0, 0)
+            else:
+                color = eff_palette[c]
+            pred_rgb[sp == node_id] = color
+        pred_rgbs.append(pred_rgb)
+
+    # Build figure
+    ncols = 2 + len(pred_rgbs)  # image, mask, preds...
+    plt.figure(figsize=(4 * ncols, 4))
+    ax = plt.subplot(1, ncols, 1)
+    ax.imshow(img_rgb)
+    ax.set_title("Image")
+    ax.axis('off')
+
+    ax = plt.subplot(1, ncols, 2)
+    ax.imshow(mask_rgb)
+    ax.set_title("Mask")
+    ax.axis('off')
+
+    for j, pred_rgb in enumerate(pred_rgbs):
+        ax = plt.subplot(1, ncols, 3 + j)
+        ax.imshow(pred_rgb)
+        ax.set_title(f"Pred: {model_labels[j]}")
+        ax.axis('off')
+
+    os.makedirs(save_dir, exist_ok=True)
+    out_path = os.path.join(save_dir, f"sample_k{k}.png")
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150)
+    if show:
+        plt.show()
+    plt.close()
+
+
+def _grouped_bar(ax, labels: List[str], series: List[List[float]], series_labels: List[str]):
+    x = np.arange(len(labels))
+    width = 0.8 / max(1, len(series))
+    for i, vals in enumerate(series):
+        ax.bar(x + i * width, vals, width, label=series_labels[i])
+    ax.set_xticks(x + width * (len(series) - 1) / 2)
+    ax.set_xticklabels(labels, rotation=30, ha='right')
+    ax.legend()
+
+
+def _plot_superpixel_distribution_for_k(
+    ds_full: GraphSuperpixelDataset,
+    model_list: List[SPNodeRegressor],
+    model_labels: List[str],
+    class_rgb_values: List[Tuple[int, int, int]],
+    unknown_index: Optional[int],
+    k_value: int,
+    normalize_node_features: bool,
+    device: torch.device,
+    save_dir: str,
+    show: bool,
+    image_index: Optional[int] = None,
+) -> None:
+    # Choose image index deterministically if provided
+    if image_index is None:
+        rng = random.Random()
+        img_idx = rng.randrange(len(ds_full.base_ds))
+    else:
+        img_idx = int(max(0, min(len(ds_full.base_ds) - 1, image_index)))
+
+    # Locate sample index for (img_idx, k_value)
+    sample_idx = None
+    for i, (im_i, k) in enumerate(ds_full.index_map):
+        if im_i == img_idx and int(k) == int(k_value):
+            sample_idx = i
+            break
+    if sample_idx is None:
+        print(f"[plot] Could not find sample for chosen image and k={k_value}")
+        return
+
+    sample = ds_full[sample_idx]
+    x = sample["x"].to(device)
+    if normalize_node_features:
+        x = F.normalize(x, p=2, dim=1)
+    edge_index = sample["edge_index"].to(device)
+    y_counts = sample["y"].cpu().numpy()  # [N,C]
+
+    # Pick the superpixel (node) with the most labels present (count > 0); break ties by total pixels
+    labels_present = (y_counts > 0).sum(axis=1)
+    totals = y_counts.sum(axis=1)
+    best_idx = int(np.lexsort((-totals, labels_present))[-1])  # sort by labels_present asc, totals asc; take last
+
+    # Forward models and get probabilities for this node
+    eff_palette = _effective_palette(class_rgb_values, unknown_index)
+    probs: List[np.ndarray] = []
+    with torch.inference_mode():
+        for model in model_list:
+            logits = model(x, edge_index)
+            p = F.softmax(logits, dim=-1)[best_idx].detach().cpu().numpy()
+            probs.append(p)
+
+    # Stacked bars of unit height for each model
+    colors = [tuple(np.array(c) / 255.0) for c in eff_palette]
+    class_names_eff = [
+        name for i, name in enumerate(class_rgb_values)
+        if not (unknown_index is not None and i == unknown_index)
+    ]
+    # class_names_eff are RGB tuples; for legend we will build patches with index labels
+    x_pos = np.arange(len(probs))
+    width = 0.6
+    plt.figure(figsize=(max(6, 3 * len(probs)), 4))
+    for i, p in enumerate(probs):
+        bottom = 0.0
+        for c_idx in range(len(p)):
+            h = float(p[c_idx])
+            if h <= 0:
+                continue
+            plt.bar(x_pos[i], h, width=width, bottom=bottom, color=colors[c_idx], edgecolor='black', linewidth=0.2)
+            bottom += h
+        # Ensure the bar reaches 1 unit for visual consistency (in case of numeric issues)
+        if bottom < 1.0:
+            plt.bar(x_pos[i], 1.0 - bottom, width=width, bottom=bottom, color=(0.95, 0.95, 0.95), edgecolor='black', linewidth=0.2)
+
+    plt.xticks(x_pos, model_labels)
+    plt.ylim(0, 1.0)
+    plt.ylabel("Predicted fraction (unit height)")
+    img_stem = Path(sample["meta"]["image_path"]).stem
+    plt.title(f"Superpixel label distribution: {img_stem} (k={k_value}, node={best_idx})")
+
+    # Build legend from top-K average important classes to avoid clutter, or all classes if small
+    try:
+        import matplotlib.patches as mpatches
+        patches = []
+        # Rank classes by average contribution across models for this node
+        mean_contrib = np.mean(np.stack(probs, axis=0), axis=0)
+        order = np.argsort(-mean_contrib)
+        max_legend = min(len(order), 10)
+        for idx in order[:max_legend]:
+            name = f"c{idx}"
+            patches.append(mpatches.Patch(color=colors[idx], label=name))
+        if patches:
+            plt.legend(handles=patches, title="Top classes", bbox_to_anchor=(1.02, 1), loc='upper left')
+    except Exception:
+        pass
+
+    os.makedirs(save_dir, exist_ok=True)
+    out_path = os.path.join(save_dir, f"superpixel_distribution_{img_stem}_k{k_value}.png")
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches='tight')
+    if show:
+        plt.show()
+    plt.close()
+
+
+def _plot_metrics_comparison(
+    save_dir: str,
+    model_labels: List[str],
+    classification_metrics: List[Tuple[float, float, float, float]],  # (p,r,f1,f2)
+    node_macro_metrics: List[dict],  # keys: mae, rmse, brier, js, hell, cos, r2, pear, spear
+    image_macro_metrics: List[dict],  # keys: mae, rmse, r2, smape, dice, js, emd
+    per_class_names: List[str],
+    per_class_r2_nodes: List[List[float]],
+    per_class_dice_images: List[List[float]],
+    show: bool,
+) -> None:
+    os.makedirs(save_dir, exist_ok=True)
+
+    # 1) Classification scalars
+    plt.figure(figsize=(8, 4))
+    labels = ["Precision", "Recall", "F1", "F2"]
+    # Series per model: values across the 4 metrics
+    series = [[cm[0], cm[1], cm[2], cm[3]] for cm in classification_metrics]
+    ax = plt.gca()
+    _grouped_bar(ax, labels, series, model_labels)
+    ax.set_title("Classification metrics (test)")
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, "classification_metrics.png"), dpi=150)
+    if show:
+        plt.show()
+    plt.close()
+
+    # 2) Node-level macro metrics
+    node_labels = ["MAE", "RMSE", "Brier", "JS", "Hellinger", "Cosine", "R2", "Pearson", "Spearman"]
+    plt.figure(figsize=(12, 4))
+    ax = plt.gca()
+    # Series per model
+    key_map = {
+        "MAE": "mae", "RMSE": "rmse", "Brier": "brier", "JS": "js", "Hellinger": "hell",
+        "Cosine": "cos", "R2": "r2", "Pearson": "pear", "Spearman": "spear"
+    }
+    series = []
+    for nm in node_macro_metrics:
+        series.append([nm[key_map[lab]] for lab in node_labels])
+    _grouped_bar(ax, node_labels, series, model_labels)
+    ax.set_title("Node-level macro metrics (test)")
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, "node_macro_metrics.png"), dpi=150)
+    if show:
+        plt.show()
+    plt.close()
+
+    # 3) Image-level macro metrics
+    img_labels = ["MAE", "RMSE", "R2", "sMAPE", "Dice", "JS", "EMD"]
+    keys = ["mae", "rmse", "r2", "smape", "dice", "js", "emd"]
+    plt.figure(figsize=(12, 4))
+    ax = plt.gca()
+    # Series per model
+    series = []
+    for im in image_macro_metrics:
+        series.append([im[k] for k in keys])
+    _grouped_bar(ax, img_labels, series, model_labels)
+    ax.set_title("Image-level macro metrics (test)")
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, "image_macro_metrics.png"), dpi=150)
+    if show:
+        plt.show()
+    plt.close()
+
+    # 4) Per-class R2 (nodes)
+    if len(per_class_names) and len(per_class_r2_nodes):
+        plt.figure(figsize=(max(8, 0.4 * len(per_class_names) * max(1, len(model_labels))), 4))
+        ax = plt.gca()
+        _grouped_bar(ax, per_class_names, per_class_r2_nodes, model_labels)
+        ax.set_ylabel("R2")
+        ax.set_title("Per-class R2 (nodes)")
+        plt.tight_layout()
+        plt.savefig(os.path.join(save_dir, "per_class_r2_nodes.png"), dpi=150)
+        if show:
+            plt.show()
+        plt.close()
+
+    # 5) Per-class Dice (images)
+    if len(per_class_names) and len(per_class_dice_images):
+        plt.figure(figsize=(max(8, 0.4 * len(per_class_names) * max(1, len(model_labels))), 4))
+        ax = plt.gca()
+        _grouped_bar(ax, per_class_names, per_class_dice_images, model_labels)
+        ax.set_ylabel("Soft Dice")
+        ax.set_title("Per-class Dice (images)")
+        plt.tight_layout()
+        plt.savefig(os.path.join(save_dir, "per_class_dice_images.png"), dpi=150)
+        if show:
+            plt.show()
+        plt.close()
+
+
 def main(cfg: EvalConfig) -> None:
     # Backend tuning for eval throughput
     try:
@@ -550,8 +882,43 @@ def main(cfg: EvalConfig) -> None:
 
     num_classes_eff = len(class_rgb_values) - (1 if (unknown_index is not None and 0 <= unknown_index < len(class_rgb_values)) else 0)
 
-    # Load model and read sidecar JSON for val split info if present
+    # Load model(s) and read sidecar JSON for val split info if present
     model = load_model(cfg, num_classes_eff)
+    model2: Optional[SPNodeRegressor] = None
+    if cfg.ckpt2_path:
+        cfg2 = EvalConfig(
+            train_dir=cfg.train_dir,
+            valid_dir=cfg.valid_dir,
+            test_dir=cfg.test_dir,
+            class_csv=cfg.class_csv,
+            img_size_w=cfg.img_size_w,
+            img_size_h=cfg.img_size_h,
+            k_values=cfg.k_values,
+            cache_dir=cfg.cache_dir,
+            feature_device=cfg.feature_device,
+            hsv_threshold=cfg.hsv_threshold,
+            feature_batch_size=cfg.feature_batch_size,
+            slic_backend=cfg.slic_backend,
+            batch_size=cfg.batch_size,
+            num_workers=cfg.num_workers,
+            prefetch_factor=cfg.prefetch_factor,
+            in_dim=cfg.in_dim,
+            hidden_dim=cfg.hidden_dim,
+            num_layers=cfg.num_layers,
+            num_heads=cfg.num_heads,
+            gat_dropout=cfg.gat_dropout,
+            integrate_dropout=cfg.integrate_dropout,
+            normalize_node_features=cfg.normalize_node_features,
+            device=cfg.device,
+            seed=cfg.seed,
+            ckpt_path=cfg.ckpt2_path,
+            ckpt2_path=None,
+            plot_sample=cfg.plot_sample,
+            plot_k=cfg.plot_k,
+            save_plots_dir=cfg.save_plots_dir,
+            no_show=cfg.no_show,
+        )
+        model2 = load_model(cfg2, num_classes_eff)
     arch_meta_path = Path(cfg.ckpt_path).with_suffix('.json') if cfg.ckpt_path else None
     val_image_ids: Optional[List[str]] = None
     if arch_meta_path is not None and arch_meta_path.exists():
@@ -591,17 +958,34 @@ def main(cfg: EvalConfig) -> None:
     # Collect validation scores and calibrate thresholds on valid only (classification-style)
     y_score_val, y_true_val = collect_image_scores(model, valid_loader, cfg.normalize_node_features)
     thresholds = calibrate_thresholds(y_score_val, y_true_val, beta=2.0)
+    thresholds2 = None
+    if model2 is not None:
+        y_score_val2, y_true_val2 = collect_image_scores(model2, valid_loader, cfg.normalize_node_features)
+        thresholds2 = calibrate_thresholds(y_score_val2, y_true_val2, beta=2.0)
 
     # Evaluate on test (classification-style summary)
     y_score_test, y_true_test = collect_image_scores(model, test_loader, cfg.normalize_node_features)
     p, r, f1, f2 = example_based_metrics(y_true_test, y_score_test, thresholds)
     print("Classification-style (image presence) metrics on test:")
     print(f"Precision: {p*100:.2f}%  Recall: {r*100:.2f}%  F1: {f1*100:.2f}%  F2: {f2*100:.2f}%")
+    p2 = r2 = f12 = f22 = None
+    if model2 is not None and thresholds2 is not None:
+        y_score_test2, y_true_test2 = collect_image_scores(model2, test_loader, cfg.normalize_node_features)
+        p2, r2, f12, f22 = example_based_metrics(y_true_test2, y_score_test2, thresholds2)
+        print("Classification-style metrics on test (Model 2):")
+        print(f"Precision: {p2*100:.2f}%  Recall: {r2*100:.2f}%  F1: {f12*100:.2f}%  F2: {f22*100:.2f}%")
 
     # Collect regression data (node-level and image-level distributions)
     reg = collect_regression_data(model, test_loader, cfg.normalize_node_features)
     nodes = reg["nodes"]
     images = reg["images"]
+
+    # Containers for plotting
+    class_labels_eff = [n for i, n in enumerate(names) if not (unknown_index is not None and i == unknown_index)]
+    node_macro_plot = None
+    img_macro_plot = None
+    per_class_r2_plot = None
+    per_class_dice_plot = None
 
     if nodes["y_true"].numel() > 0:
         y_true_nodes = nodes["y_true"].numpy()
@@ -625,6 +1009,19 @@ def main(cfg: EvalConfig) -> None:
         # print(f"R2 per class: {r2_pc}")
         print(f"Pearson per class (macro): {pear_macro:.4f}  Spearman per class (macro): {spear_macro:.4f}")
 
+        node_macro_plot = {
+            "mae": float(node_mae),
+            "rmse": float(node_rmse),
+            "brier": float(node_brier),
+            "js": float(node_js),
+            "hell": float(node_hell),
+            "cos": float(node_cos),
+            "r2": float(r2_macro),
+            "pear": float(pear_macro),
+            "spear": float(spear_macro),
+        }
+        per_class_r2_plot = [float(r2_pc[c]) for c in range(len(class_labels_eff))]
+
     if images["y_true"].numel() > 0:
         y_true_img = images["y_true"].numpy()
         y_pred_img = images["y_pred"].numpy()
@@ -640,17 +1037,166 @@ def main(cfg: EvalConfig) -> None:
         print(f"Micro MAE: {img_scores['micro']['mae']:.6f}  Micro RMSE: {img_scores['micro']['rmse']:.6f}")
         print(f"Soft Dice per class (macro): {dice_macro:.6f}  JS-divergence (avg): {js_img:.6f}  1D-EMD (avg): {emd_img:.6f}")
 
+        img_macro_plot = {
+            "mae": float(img_scores["macro"]["mae"]),
+            "rmse": float(img_scores["macro"]["rmse"]),
+            "r2": float(img_scores["macro"]["r2"]),
+            "smape": float(img_scores["macro"]["smape"]),
+            "dice": float(dice_macro),
+            "js": float(js_img),
+            "emd": float(emd_img),
+        }
+        per_class_dice_plot = [float(dice_pc[c]) for c in range(len(class_labels_eff))]
+
+    # Repeat metrics collection for model2 if provided
+    class_metrics = [(p, r, f1, f2)]
+    node_macro_metrics = [node_macro_plot] if node_macro_plot is not None else []
+    image_macro_metrics = [img_macro_plot] if img_macro_plot is not None else []
+    per_class_r2_all = [per_class_r2_plot] if per_class_r2_plot is not None else []
+    per_class_dice_all = [per_class_dice_plot] if per_class_dice_plot is not None else []
+
+    if model2 is not None:
+        reg2 = collect_regression_data(model2, test_loader, cfg.normalize_node_features)
+        nodes2 = reg2["nodes"]
+        images2 = reg2["images"]
+
+        # Node-level
+        if nodes2["y_true"].numel() > 0:
+            y_true_nodes2 = nodes2["y_true"].numpy()
+            y_pred_nodes2 = nodes2["y_pred"].numpy()
+            w_nodes2 = nodes2["weights"].numpy()
+            node_mae2 = mae_weighted_nodes(y_true_nodes2, y_pred_nodes2, w_nodes2)
+            node_rmse2 = rmse_weighted_nodes(y_true_nodes2, y_pred_nodes2, w_nodes2)
+            node_brier2 = brier_score_weighted_nodes(y_true_nodes2, y_pred_nodes2, w_nodes2)
+            node_js2 = _js_divergence_batch(y_true_nodes2, y_pred_nodes2, w_nodes2)
+            node_hell2 = _hellinger_batch(y_true_nodes2, y_pred_nodes2, w_nodes2)
+            node_cos2 = _cosine_sim_batch(y_true_nodes2, y_pred_nodes2, w_nodes2)
+            r2_pc2, r2_macro2 = r2_per_class_nodes(y_true_nodes2, y_pred_nodes2, w_nodes2)
+            pear_pc2, spear_pc2, pear_macro2, spear_macro2 = pearson_spearman_per_class_nodes(y_true_nodes2, y_pred_nodes2)
+            node_macro_metrics.append({
+                "mae": float(node_mae2),
+                "rmse": float(node_rmse2),
+                "brier": float(node_brier2),
+                "js": float(node_js2),
+                "hell": float(node_hell2),
+                "cos": float(node_cos2),
+                "r2": float(r2_macro2),
+                "pear": float(pear_macro2),
+                "spear": float(spear_macro2),
+            })
+            per_class_r2_all.append([float(r2_pc2[c]) for c in range(len(class_labels_eff))])
+
+        # Image-level
+        if images2["y_true"].numel() > 0:
+            y_true_img2 = images2["y_true"].numpy()
+            y_pred_img2 = images2["y_pred"].numpy()
+            w_img2 = images2["weights"].numpy()
+            img_scores2 = per_class_regression_scores_images(y_true_img2, y_pred_img2, w_img2)
+            dice_pc2, dice_macro2 = soft_dice_per_class(y_true_img2, y_pred_img2)
+            js_img2 = js_divergence_images(y_true_img2, y_pred_img2)
+            emd_img2 = emd_1d_images(y_true_img2, y_pred_img2)
+            image_macro_metrics.append({
+                "mae": float(img_scores2["macro"]["mae"]),
+                "rmse": float(img_scores2["macro"]["rmse"]),
+                "r2": float(img_scores2["macro"]["r2"]),
+                "smape": float(img_scores2["macro"]["smape"]),
+                "dice": float(dice_macro2),
+                "js": float(js_img2),
+                "emd": float(emd_img2),
+            })
+            per_class_dice_all.append([float(dice_pc2[c]) for c in range(len(class_labels_eff))])
+
+        if p2 is not None:
+            class_metrics.append((p2, r2, f12, f22))
+
+    # Optional plotting
+    if cfg.plot_sample:
+        # Honor specific k if provided, else use first available
+        k_for_plot = int(cfg.plot_k) if (cfg.plot_k is not None) else int(ds_full.k_values[0])
+        if k_for_plot not in ds_full.k_values:
+            print(f"[plot] Requested k={k_for_plot} not in dataset k_values={ds_full.k_values}; using {ds_full.k_values[0]}")
+            k_for_plot = int(ds_full.k_values[0])
+        labels = [Path(cfg.ckpt_path).stem]
+        models = [model]
+        if model2 is not None:
+            labels.append(Path(cfg.ckpt2_path).stem)
+            models.append(model2)
+        # Resolve image index if specified
+        img_index_for_plot: Optional[int] = None
+        if cfg.plot_image is not None:
+            # Accept numeric index or image stem
+            try:
+                img_index_for_plot = int(cfg.plot_image)
+            except Exception:
+                stems = [Path(p).stem for p in ds_full.base_ds.image_paths]
+                if cfg.plot_image in stems:
+                    img_index_for_plot = stems.index(cfg.plot_image)
+                else:
+                    print(f"[plot] plot_image='{cfg.plot_image}' not found; using random image")
+        _plot_random_sample_for_k(
+            ds_full=ds_full,
+            model_list=models,
+            model_labels=labels,
+            names=names,
+            class_rgb_values=class_rgb_values,
+            unknown_index=unknown_index,
+            k_value=k_for_plot,
+            normalize_node_features=cfg.normalize_node_features,
+            device=next(model.parameters()).device,
+            save_dir=cfg.save_plots_dir,
+            show=(not cfg.no_show),
+            image_index=img_index_for_plot,
+        )
+        _plot_superpixel_distribution_for_k(
+            ds_full=ds_full,
+            model_list=models,
+            model_labels=labels,
+            class_rgb_values=class_rgb_values,
+            unknown_index=unknown_index,
+            k_value=k_for_plot,
+            normalize_node_features=cfg.normalize_node_features,
+            device=next(model.parameters()).device,
+            save_dir=cfg.save_plots_dir,
+            show=(not cfg.no_show),
+            image_index=img_index_for_plot,
+        )
+
+    # Metrics comparison plots (if we have at least one set)
+    if len(class_metrics) >= 1 and (len(node_macro_metrics) >= 1 or len(image_macro_metrics) >= 1):
+        model_labels = [Path(cfg.ckpt_path).stem]
+        if model2 is not None:
+            model_labels.append(Path(cfg.ckpt2_path).stem)
+        # Normalize lengths in case some parts missing
+        while len(node_macro_metrics) < len(model_labels):
+            node_macro_metrics.append(node_macro_metrics[-1])
+        while len(image_macro_metrics) < len(model_labels):
+            image_macro_metrics.append(image_macro_metrics[-1])
+        while len(class_metrics) < len(model_labels):
+            class_metrics.append(class_metrics[-1])
+        _plot_metrics_comparison(
+            save_dir=cfg.save_plots_dir,
+            model_labels=model_labels,
+            classification_metrics=class_metrics,
+            node_macro_metrics=node_macro_metrics,
+            image_macro_metrics=image_macro_metrics,
+            per_class_names=class_labels_eff,
+            per_class_r2_nodes=per_class_r2_all,
+            per_class_dice_images=per_class_dice_all,
+            show=(not cfg.no_show),
+        )
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Evaluate GAT-based superpixel regressor with paper metrics")
     p.add_argument("--ckpt", type=str, required=True, help="Path to checkpoint .pt")
+    p.add_argument("--ckpt2", type=str, default=None, help="Optional second checkpoint to compare")
     p.add_argument("--train_dir", type=str, default=None)
     p.add_argument("--valid_dir", type=str, default=None)
     p.add_argument("--test_dir", type=str, default=None)
     p.add_argument("--class_csv", type=str, default=None)
     p.add_argument("--img_size_w", type=int, default=None)
     p.add_argument("--img_size_h", type=int, default=None)
-    p.add_argument("--k_values", type=int, nargs="+", default=None)
+    p.add_argument("--k_values", type=int, nargs="+", default=None, help="One or more k values for SLIC. Use with --plot_k to select a specific k to visualize.")
     p.add_argument("--cache_dir", type=str, default=None)
     p.add_argument("--feature_device", type=str, default=None)
     p.add_argument("--device", type=str, default=None)
@@ -660,6 +1206,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--hsv_threshold", type=float, default=None)
     p.add_argument("--slic_backend", type=str, default=None, choices=["cpu"])  # fixed to skimage
+    # Plot flags
+    p.add_argument("--plot_sample", action="store_true", help="Plot a random sample (image/mask/predictions)")
+    p.add_argument("--plot_k", type=int, default=None, help="Specific k to visualize (must be in --k_values)")
+    p.add_argument("--save_plots_dir", type=str, default=None, help="Directory to save plots")
+    p.add_argument("--no_show", action="store_true", help="Do not display plots interactively; save only")
+    p.add_argument("--plot_image", type=str, default=None, help="Image index or stem to use for plotting")
     return p.parse_args()
 
 
@@ -667,6 +1219,7 @@ if __name__ == "__main__":
     args = parse_args()
     cfg = EvalConfig()
     cfg.ckpt_path = args.ckpt
+    cfg.ckpt2_path = args.ckpt2
     if args.train_dir is not None: cfg.train_dir = args.train_dir
     if args.valid_dir is not None: cfg.valid_dir = args.valid_dir
     if args.test_dir is not None: cfg.test_dir = args.test_dir
@@ -683,6 +1236,11 @@ if __name__ == "__main__":
     if args.seed is not None: cfg.seed = args.seed
     if args.hsv_threshold is not None: cfg.hsv_threshold = args.hsv_threshold
     if args.slic_backend is not None: cfg.slic_backend = args.slic_backend
+    if args.plot_sample: cfg.plot_sample = True
+    if args.plot_k is not None: cfg.plot_k = args.plot_k
+    if args.save_plots_dir is not None: cfg.save_plots_dir = args.save_plots_dir
+    if args.no_show: cfg.no_show = True
+    if args.plot_image is not None: cfg.plot_image = args.plot_image
     main(cfg)
 
 
