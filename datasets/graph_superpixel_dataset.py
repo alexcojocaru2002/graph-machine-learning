@@ -227,9 +227,10 @@ class GraphSuperpixelDataset(Dataset):
                     X = torch.from_numpy(data["X"])  # [N, 1024]
                     sp = data["sp"].astype(np.int64)
             except Exception:
-                X, sp = X, sp
-        else:
-            # Backward-compat: try legacy cache naming
+                X, sp = None, None
+
+        # Backward-compat: try legacy cache naming if still missing
+        if X is None or sp is None:
             legacy_path = self._legacy_features_cache_key(image_path, k, self.base_ds.img_size)
             if legacy_path.exists():
                 try:
@@ -243,46 +244,46 @@ class GraphSuperpixelDataset(Dataset):
                         pass
                 except Exception:
                     X, sp = None, None
-            # If still missing, compute now and persist if caching enabled
-            if X is None or sp is None:
-                # Try to reuse cached backbone maps
-                F4 = None
-                F5 = None
+
+        # If still missing, compute now and persist if caching enabled
+        if X is None or sp is None:
+            # Try to reuse cached backbone maps
+            F4 = None
+            F5 = None
+            if self.cache_backbone_maps:
+                bb_path = self._backbone_cache_key(image_path, self.base_ds.img_size)
+                if bb_path.exists():
+                    try:
+                        bb = np.load(bb_path, mmap_mode='r')
+                        F4 = torch.from_numpy(bb["F4"])  # [512,h4,w4]
+                        F5 = torch.from_numpy(bb["F5"])  # [512,h5,w5]
+                    except Exception:
+                        F4, F5 = None, None
+            if (F4 is None) or (F5 is None):
+                F4, F5 = compute_backbone_maps_vgg(img_t, device=self.feature_device, backbone=self.backbone, use_amp=self.use_amp)
                 if self.cache_backbone_maps:
-                    bb_path = self._backbone_cache_key(image_path, self.base_ds.img_size)
-                    if bb_path.exists():
-                        try:
-                            bb = np.load(bb_path, mmap_mode='r')
-                            F4 = torch.from_numpy(bb["F4"])  # [512,h4,w4]
-                            F5 = torch.from_numpy(bb["F5"])  # [512,h5,w5]
-                        except Exception:
-                            F4, F5 = None, None
-                if (F4 is None) or (F5 is None):
-                    F4, F5 = compute_backbone_maps_vgg(img_t, device=self.feature_device, backbone=self.backbone, use_amp=self.use_amp)
-                    if self.cache_backbone_maps:
-                        try:
-                            self._atomic_savez(self._backbone_cache_key(image_path, self.base_ds.img_size), F4=F4.numpy(), F5=F5.numpy())
-                        except Exception:
-                            pass
-                sp = slic_labels(
-                    img_rgb,
-                    n_segments=k,
-                    compactness=self.slic_compactness,
-                    sigma=self.slic_sigma,
-                    start_label=self.slic_start_label,
-                    backend=self.slic_backend,
-                )
-                X = pool_from_backbone_maps_max(F4, F5, sp, device=self.feature_device)
-                # Persist both legacy .npz and fast .npy for future runs
-                try:
-                    self._atomic_savez(feat_cache_path, X=X.numpy(), sp=sp)
-                except Exception:
-                    pass
-                try:
-                    np.save(x_path, X.numpy())
-                    np.save(sp_path, sp)
-                except Exception:
-                    pass
+                    try:
+                        self._atomic_savez(self._backbone_cache_key(image_path, self.base_ds.img_size), F4=F4.numpy(), F5=F5.numpy())
+                    except Exception:
+                        pass
+            sp = slic_labels(
+                img_rgb,
+                n_segments=k,
+                compactness=self.slic_compactness,
+                sigma=self.slic_sigma,
+                start_label=self.slic_start_label,
+            )
+            X = pool_from_backbone_maps_max(F4, F5, sp, device=self.feature_device)
+            # Persist both legacy .npz and fast .npy for future runs
+            try:
+                self._atomic_savez(feat_cache_path, X=X.numpy(), sp=sp)
+            except Exception:
+                pass
+            try:
+                np.save(x_path, X.numpy())
+                np.save(sp_path, sp)
+            except Exception:
+                pass
         # Populate global memory cache
         _GLOBAL_FEATURES[gkey_feat] = (X, sp)
 
