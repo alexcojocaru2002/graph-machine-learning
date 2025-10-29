@@ -959,6 +959,13 @@ def main(cfg: EvalConfig) -> None:
     ds_test = torch.utils.data.Subset(ds_full, test_sample_indices)
 
     # DataLoaders
+    # Avoid CUDA-in-fork: if feature extraction runs on CUDA, don't use worker processes
+    try:
+        if torch.device(cfg.feature_device).type == "cuda" and (cfg.num_workers is None or cfg.num_workers > 0):
+            print("[eval] Detected CUDA feature extraction with DataLoader workers > 0; setting num_workers=0 to avoid CUDA-in-fork.")
+            cfg.num_workers = 0
+    except Exception:
+        pass
     pin_memory = (torch.device(cfg.device).type == "cuda")
     valid_loader = DataLoader(ds_valid, batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers, collate_fn=collate_graphs, pin_memory=pin_memory, persistent_workers=(cfg.num_workers > 0), prefetch_factor=(cfg.prefetch_factor if cfg.num_workers > 0 else None))
     test_loader = DataLoader(ds_test, batch_size=cfg.batch_size, shuffle=False, num_workers=cfg.num_workers, collate_fn=collate_graphs, pin_memory=pin_memory, persistent_workers=(cfg.num_workers > 0), prefetch_factor=(cfg.prefetch_factor if cfg.num_workers > 0 else None))
