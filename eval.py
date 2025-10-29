@@ -19,6 +19,7 @@ from load_palette import load_class_palette
 from datasets.graph_superpixel_dataset import GraphSuperpixelDataset
 from models.gat import SPNodeRegressor
 from train import collate_graphs as train_collate_graphs
+from utils.logger import TrainLogger
 import json
 try:
     from torch.amp import autocast as torch_autocast
@@ -59,6 +60,10 @@ class EvalConfig:
     # Device
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     seed: int = 42
+
+    # Logging
+    use_wandb: bool = False
+    wandb_project: str = "graph-ml"
 
     # Checkpoint
     ckpt_path: Optional[str] = None
@@ -871,6 +876,9 @@ def main(cfg: EvalConfig) -> None:
         torch.set_float32_matmul_precision("high")
     except Exception:
         pass
+    # Initialize logger (no-op if disabled)
+    logger = TrainLogger(use_wandb=cfg.use_wandb, project=cfg.wandb_project, run_name=(f"eval-{Path(cfg.ckpt_path).stem}" if cfg.ckpt_path else "eval"))
+
     # Shared backbone for all splits, built once
     backbone = vgg16(weights=VGG16_Weights.IMAGENET1K_V1).features.to(cfg.feature_device).eval()
     img_size = None
@@ -1185,6 +1193,110 @@ def main(cfg: EvalConfig) -> None:
             show=(not cfg.no_show),
         )
 
+        # Log plots to Weights & Biases both as images and as data tables
+        if cfg.use_wandb:
+            try:
+                import wandb  # type: ignore
+                # 1) Classification metrics table
+                cls_table = wandb.Table(columns=["model", "precision", "recall", "f1", "f2"])
+                for m_label, (pp, rr, ff1, ff2) in zip(model_labels, class_metrics):
+                    cls_table.add_data(m_label, float(pp), float(rr), float(ff1), float(ff2))
+                logger.log({"eval/tables/classification_metrics": cls_table})
+
+                # 2) Node-level macro metrics table
+                if len(node_macro_metrics) >= 1:
+                    node_table = wandb.Table(columns=["model", "mae", "rmse", "brier", "js", "hell", "cos", "r2", "pearson", "spearman"])
+                    for m_label, nm in zip(model_labels, node_macro_metrics):
+                        node_table.add_data(
+                            m_label,
+                            float(nm.get("mae", float("nan"))),
+                            float(nm.get("rmse", float("nan"))),
+                            float(nm.get("brier", float("nan"))),
+                            float(nm.get("js", float("nan"))),
+                            float(nm.get("hell", float("nan"))),
+                            float(nm.get("cos", float("nan"))),
+                            float(nm.get("r2", float("nan"))),
+                            float(nm.get("pear", float("nan"))),
+                            float(nm.get("spear", float("nan"))),
+                        )
+                    logger.log({"eval/tables/node_macro_metrics": node_table})
+
+                # 3) Image-level macro metrics table
+                if len(image_macro_metrics) >= 1:
+                    img_table = wandb.Table(columns=["model", "mae", "rmse", "r2", "smape", "dice", "js", "emd"])
+                    for m_label, im in zip(model_labels, image_macro_metrics):
+                        img_table.add_data(
+                            m_label,
+                            float(im.get("mae", float("nan"))),
+                            float(im.get("rmse", float("nan"))),
+                            float(im.get("r2", float("nan"))),
+                            float(im.get("smape", float("nan"))),
+                            float(im.get("dice", float("nan"))),
+                            float(im.get("js", float("nan"))),
+                            float(im.get("emd", float("nan"))),
+                        )
+                    logger.log({"eval/tables/image_macro_metrics": img_table})
+
+                # 4) Per-class tables (R2 for nodes, Dice for images)
+                if len(per_class_r2_all) >= 1 and len(class_labels_eff) >= 1:
+                    pc_r2_cols = ["class"] + list(model_labels)
+                    pc_r2_table = wandb.Table(columns=pc_r2_cols)
+                    for ci, cname in enumerate(class_labels_eff):
+                        row = [str(cname)] + [float(r2_list[ci]) for r2_list in per_class_r2_all]
+                        pc_r2_table.add_data(*row)
+                    logger.log({"eval/tables/per_class_r2_nodes": pc_r2_table})
+                if len(per_class_dice_all) >= 1 and len(class_labels_eff) >= 1:
+                    pc_dice_cols = ["class"] + list(model_labels)
+                    pc_dice_table = wandb.Table(columns=pc_dice_cols)
+                    for ci, cname in enumerate(class_labels_eff):
+                        row = [str(cname)] + [float(dice_list[ci]) for dice_list in per_class_dice_all]
+                        pc_dice_table.add_data(*row)
+                    logger.log({"eval/tables/per_class_dice_images": pc_dice_table})
+
+                # 5) Log the generated plot images
+                plot_files = [
+                    os.path.join(cfg.save_plots_dir, "classification_metrics.png"),
+                    os.path.join(cfg.save_plots_dir, "node_macro_metrics.png"),
+                    os.path.join(cfg.save_plots_dir, "image_macro_metrics.png"),
+                ]
+                # Conditionally present plots
+                r2_plot = os.path.join(cfg.save_plots_dir, "per_class_r2_nodes.png")
+                dice_plot = os.path.join(cfg.save_plots_dir, "per_class_dice_images.png")
+                if os.path.exists(r2_plot):
+                    plot_files.append(r2_plot)
+                if os.path.exists(dice_plot):
+                    plot_files.append(dice_plot)
+
+                img_payload = {}
+                for pth in plot_files:
+                    if os.path.exists(pth):
+                        key = f"eval/plots/{Path(pth).name.replace('.png','')}"
+                        img_payload[key] = wandb.Image(pth)
+                if len(img_payload) > 0:
+                    logger.log(img_payload)
+
+                # 6) Log sample visualization plots if present
+                # sample_k*.png and superpixel_distribution_*.png
+                extra_imgs = []
+                for fname in os.listdir(cfg.save_plots_dir):
+                    if fname.startswith("sample_k") and fname.endswith(".png"):
+                        extra_imgs.append(os.path.join(cfg.save_plots_dir, fname))
+                    if fname.startswith("superpixel_distribution_") and fname.endswith(".png"):
+                        extra_imgs.append(os.path.join(cfg.save_plots_dir, fname))
+                extra_payload = {}
+                for pth in extra_imgs:
+                    extra_payload[f"eval/plots/{Path(pth).name.replace('.png','')}"] = wandb.Image(pth)
+                if len(extra_payload) > 0:
+                    logger.log(extra_payload)
+            except Exception:
+                pass
+
+    # Finish logger
+    try:
+        logger.finish()
+    except Exception:
+        pass
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Evaluate GAT-based superpixel regressor with paper metrics")
@@ -1212,6 +1324,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--save_plots_dir", type=str, default=None, help="Directory to save plots")
     p.add_argument("--no_show", action="store_true", help="Do not display plots interactively; save only")
     p.add_argument("--plot_image", type=str, default=None, help="Image index or stem to use for plotting")
+    p.add_argument("--use_wandb", action="store_true", help="Log results to Weights & Biases, including plots as images and data tables")
+    p.add_argument("--wandb_project", type=str, default=None, help="W&B project name")
     return p.parse_args()
 
 
@@ -1241,6 +1355,8 @@ if __name__ == "__main__":
     if args.save_plots_dir is not None: cfg.save_plots_dir = args.save_plots_dir
     if args.no_show: cfg.no_show = True
     if args.plot_image is not None: cfg.plot_image = args.plot_image
+    if args.use_wandb: cfg.use_wandb = True
+    if args.wandb_project is not None: cfg.wandb_project = args.wandb_project
     main(cfg)
 
 
