@@ -24,12 +24,12 @@ feature_device: cuda
 
 # Model
 in_dim: 1024
-hidden_dim: 512
+hidden_dim: 640
 out_activation: none
-num_layers: 2
-num_heads: 3
-gat_dropout: 0.2
-integrate_dropout: 0.2
+num_layers: 3
+num_heads: 4
+gat_dropout: 0.3
+integrate_dropout: 0.3
 normalize_node_features: true
 
 # Stability
@@ -40,7 +40,7 @@ loss_type: kl  # mse | kl
 # Optim
 lr: 0.0002
 weight_decay: 0.0001
-epochs: 20
+epochs: 30
 
 # Device
 device: cuda
@@ -48,5 +48,6 @@ device: cuda
 # Logging
 out_dir: artifacts
 log_interval: 10
+checkpoint_name: gat_regressor_k_60_80_300_500
 
 

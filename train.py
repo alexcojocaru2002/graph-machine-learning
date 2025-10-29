@@ -107,6 +107,7 @@ class TrainConfig:
     # Logging / ckpt
     out_dir: str = "artifacts/"  # save model checkpoints
     log_interval: int = 10
+    checkpoint_name: Optional[str] = None
 
 
 def collate_graphs(batch):
@@ -354,7 +355,12 @@ def train_loop(cfg: TrainConfig) -> None:
             step += 1
 
         # Save checkpoint after each epoch
-        ckpt_path = out_dir / f"gat_regressor_epoch{epoch:03d}.pt"
+        # If a checkpoint_name is provided, always overwrite that file (keep latest only)
+        if cfg.checkpoint_name:
+            fname = str(cfg.checkpoint_name)
+            ckpt_path = out_dir / (fname if fname.endswith(".pt") else f"{fname}.pt")
+        else:
+            ckpt_path = out_dir / f"gat_regressor_epoch{epoch:03d}.pt"
         torch.save({
             "epoch": epoch,
             "model_state": model.state_dict(),
@@ -391,8 +397,8 @@ def train_loop(cfg: TrainConfig) -> None:
         # Upload artifacts to Weights & Biases when enabled
         if cfg.use_wandb:
             try:
-                logger.log_artifact(ckpt_path, name=f"ckpt_epoch_{epoch:03d}.pt", type="checkpoint")
-                logger.log_artifact(ckpt_path.with_suffix('.json'), name=f"ckpt_meta_epoch_{epoch:03d}.json", type="metadata")
+                logger.log_artifact(ckpt_path, name=ckpt_path.name, type="checkpoint")
+                logger.log_artifact(ckpt_path.with_suffix('.json'), name=ckpt_path.with_suffix('.json').name, type="metadata")
             except Exception:
                 pass
 
@@ -514,6 +520,7 @@ def parse_args() -> argparse.Namespace:
     # Logging
     p.add_argument("--out_dir", type=str, default=None)
     p.add_argument("--log_interval", type=int, default=None)
+    p.add_argument("--checkpoint_name", type=str, default=None)
 
     return p.parse_args()
 

@@ -48,5 +48,6 @@ device: cuda
 # Logging
 out_dir: artifacts
 log_interval: 10
+checkpoint_name: gat_regressor_single_k
 
 
