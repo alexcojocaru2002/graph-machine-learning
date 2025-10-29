@@ -499,6 +499,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--in_dim", type=int, default=None)
     p.add_argument("--hidden_dim", type=int, default=None)
     p.add_argument("--out_activation", type=str, default=None, choices=["relu", "sigmoid", "none"])
+    p.add_argument("--loss_type", type=str, default=None, choices=["mse", "kl"])
     p.add_argument("--num_layers", type=int, default=None)
     p.add_argument("--num_heads", type=int, default=None)
     p.add_argument("--gat_dropout", type=float, default=None)
