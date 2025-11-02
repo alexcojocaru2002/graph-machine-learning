@@ -1,3 +1,16 @@
 .idea
 data/
 glob
+datasets/__pycache__/
+
+artifacts/
+
+wandb/
+
+utils/__pycache__/
+
+models/__pycache__/
+
+2020_mrsiscccnnagnn/
+
+__pycache__/
