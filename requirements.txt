@@ -4,3 +4,10 @@ torch
 torchvision
 torchgeo
 scikit-image
+pyyaml
+tqdm
+wandb
+pillow
+matplotlib
+# Optional GPU SLIC acceleration via cuCIM (fallback to CPU if unavailable)
+cucim; platform_system == "Linux"

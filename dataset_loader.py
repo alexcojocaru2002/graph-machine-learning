@@ -2,7 +2,7 @@ from typing import Optional
 
 import numpy as np
 import os
-from sympy.printing.pytorch import torch
+import torch
 from torchvision import transforms
 from torch.utils.data import Dataset, DataLoader
 from PIL import Image
