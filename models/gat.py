@@ -244,4 +244,53 @@ class SPNodeRegressor(nn.Module):
             y = F.softmax(y, dim=-1)
         return y
 
+    @staticmethod
+    def load_model(cfg, num_classes_eff: int) -> "SPNodeRegressor":
+        """
+        Build SPNodeRegressor based on checkpoint-sidecar architecture metadata if available,
+        otherwise fall back to values in cfg. Also loads checkpoint weights if provided.
+        Note: imports Path/json locally to avoid introducing top-level deps/cycles.
+        """
+        from pathlib import Path  # local import to avoid global dependency
+        import json               # local import to avoid global dependency
 
+        device = torch.device(cfg.device)
+        arch_path = Path(cfg.ckpt_path).with_suffix('.json') if getattr(cfg, 'ckpt_path', None) else None
+        arch = None
+        if arch_path is not None and arch_path.exists():
+            with open(arch_path, 'r') as f:
+                meta = json.load(f)
+            arch = meta.get("architecture", None)
+
+        if arch is not None:
+            out_dim = arch.get("out_dim", num_classes_eff)
+            if out_dim != num_classes_eff:
+                out_dim = num_classes_eff
+            model = SPNodeRegressor(
+                in_dim=arch.get("in_dim", cfg.in_dim),
+                hidden_dim=arch.get("hidden_dim", cfg.hidden_dim),
+                out_dim=out_dim,
+                num_layers=arch.get("num_layers", cfg.num_layers),
+                num_heads=arch.get("num_heads", cfg.num_heads),
+                dropout=arch.get("dropout", cfg.gat_dropout),
+                integrate_dropout=arch.get("integrate_dropout", cfg.integrate_dropout),
+                activation=arch.get("activation", "relu"),
+                final_activation=arch.get("final_activation", None),
+            ).to(device)
+        else:
+            model = SPNodeRegressor(
+                in_dim=cfg.in_dim,
+                hidden_dim=cfg.hidden_dim,
+                out_dim=num_classes_eff,
+                num_layers=cfg.num_layers,
+                num_heads=cfg.num_heads,
+                dropout=cfg.gat_dropout,
+                integrate_dropout=cfg.integrate_dropout,
+                final_activation=None,
+            ).to(device)
+
+        if getattr(cfg, 'ckpt_path', None) is not None:
+            ckpt = torch.load(cfg.ckpt_path, map_location=device)
+            model.load_state_dict(ckpt["model_state"])
+        model.eval()
+        return model
