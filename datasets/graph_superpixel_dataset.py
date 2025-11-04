@@ -12,7 +12,6 @@ from torch.utils.data import Dataset
 
 from dataset_loader import DeepGlobeDataset
 from feature_extractor import (
-    extract_features,
     compute_backbone_maps_vgg,
     pool_from_backbone_maps_max,
     compute_backbone_maps_vgg_batch,

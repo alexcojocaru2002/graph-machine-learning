@@ -499,54 +499,6 @@ def per_class_regression_scores_images(y_true: np.ndarray, y_pred: np.ndarray, i
     }
     return out
 
-
-def load_model(cfg: EvalConfig, num_classes_eff: int) -> SPNodeRegressor:
-    device = torch.device(cfg.device)
-    # Try to load sidecar JSON for architecture
-    arch_path = Path(cfg.ckpt_path).with_suffix('.json') if cfg.ckpt_path else None
-    arch = None
-    if arch_path is not None and arch_path.exists():
-        with open(arch_path, 'r') as f:
-            meta = json.load(f)
-        arch = meta.get("architecture", None)
-
-    if arch is not None:
-        # Build model from recorded architecture, with guard against class count mismatch
-        out_dim = arch.get("out_dim", num_classes_eff)
-        if out_dim != num_classes_eff:
-            # Prefer dataset-driven class count to avoid silent mismatch
-            out_dim = num_classes_eff
-        model = SPNodeRegressor(
-            in_dim=arch.get("in_dim", cfg.in_dim),
-            hidden_dim=arch.get("hidden_dim", cfg.hidden_dim),
-            out_dim=out_dim,
-            num_layers=arch.get("num_layers", cfg.num_layers),
-            num_heads=arch.get("num_heads", cfg.num_heads),
-            dropout=arch.get("dropout", cfg.gat_dropout),
-            integrate_dropout=arch.get("integrate_dropout", cfg.integrate_dropout),
-            activation=arch.get("activation", "relu"),
-            final_activation=arch.get("final_activation", None),
-        ).to(device)
-    else:
-        # Fallback to CLI/config
-        model = SPNodeRegressor(
-            in_dim=cfg.in_dim,
-            hidden_dim=cfg.hidden_dim,
-            out_dim=num_classes_eff,
-            num_layers=cfg.num_layers,
-            num_heads=cfg.num_heads,
-            dropout=cfg.gat_dropout,
-            integrate_dropout=cfg.integrate_dropout,
-            final_activation=None,
-        ).to(device)
-
-    if cfg.ckpt_path is not None:
-        ckpt = torch.load(cfg.ckpt_path, map_location=device)
-        model.load_state_dict(ckpt["model_state"])
-    model.eval()
-    return model
-
-
 def _mask_idx_to_rgb(mask_idx: np.ndarray, class_rgb_values: List[Tuple[int, int, int]]) -> np.ndarray:
     H, W = mask_idx.shape
     out = np.zeros((H, W, 3), dtype=np.uint8)
@@ -891,7 +843,7 @@ def main(cfg: EvalConfig) -> None:
     num_classes_eff = len(class_rgb_values) - (1 if (unknown_index is not None and 0 <= unknown_index < len(class_rgb_values)) else 0)
 
     # Load model(s) and read sidecar JSON for val split info if present
-    model = load_model(cfg, num_classes_eff)
+    model = SPNodeRegressor.load_model(cfg, num_classes_eff)
     model2: Optional[SPNodeRegressor] = None
     if cfg.ckpt2_path:
         cfg2 = EvalConfig(
@@ -926,7 +878,7 @@ def main(cfg: EvalConfig) -> None:
             save_plots_dir=cfg.save_plots_dir,
             no_show=cfg.no_show,
         )
-        model2 = load_model(cfg2, num_classes_eff)
+        model2 = SPNodeRegressor.load_model(cfg2, num_classes_eff)
     arch_meta_path = Path(cfg.ckpt_path).with_suffix('.json') if cfg.ckpt_path else None
     val_image_ids: Optional[List[str]] = None
     if arch_meta_path is not None and arch_meta_path.exists():
