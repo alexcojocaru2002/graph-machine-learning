@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
 
@@ -12,9 +11,9 @@ from torch.utils.data import DataLoader
 from torchvision.models import vgg16, VGG16_Weights
 import os
 import random
-import matplotlib
 import matplotlib.pyplot as plt
 
+from config.eval_config import EvalConfig
 from load_palette import load_class_palette
 from datasets.graph_superpixel_dataset import GraphSuperpixelDataset
 from models.gat import SPNodeRegressor
@@ -25,57 +24,6 @@ try:
     from torch.amp import autocast as torch_autocast
 except Exception:
     from torch.cuda.amp import autocast as torch_autocast
-
-
-@dataclass
-class EvalConfig:
-    # Data (explicit train/valid/test roots)
-    train_dir: str = "data/train"
-    valid_dir: str = "data/valid"
-    test_dir: str = "data/test"
-    class_csv: str = "data/class_dict.csv"
-    img_size_w: Optional[int] = 512
-    img_size_h: Optional[int] = 512
-    k_values: Sequence[int] = (60,)
-    cache_dir: str = "artifacts/features"
-    feature_device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    hsv_threshold: float = 0.2
-    feature_batch_size: int = 8
-    slic_backend: str = "cpu"
-
-    # Loader
-    batch_size: int = 16
-    num_workers: int = 2
-    prefetch_factor: int = 2
-
-    # Model
-    in_dim: int = 1024
-    hidden_dim: int = 512
-    num_layers: int = 2
-    num_heads: int = 3
-    gat_dropout: float = 0.2
-    integrate_dropout: float = 0.2
-    normalize_node_features: bool = True
-
-    # Device
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    seed: int = 42
-
-    # Logging
-    use_wandb: bool = False
-    wandb_project: str = "graph-ml"
-
-    # Checkpoint
-    ckpt_path: Optional[str] = None
-    ckpt2_path: Optional[str] = None
-
-    # Plotting
-    plot_sample: bool = False
-    plot_k: Optional[int] = None
-    save_plots_dir: str = "artifacts/plots"
-    no_show: bool = True
-    plot_image: Optional[str] = None  # image stem or index to use for plotting
-
 
 def collate_graphs(batch):
     return train_collate_graphs(batch)
@@ -511,6 +459,236 @@ def _effective_palette(class_rgb_values: List[Tuple[int, int, int]], unknown_ind
     if unknown_index is None or unknown_index < 0 or unknown_index >= len(class_rgb_values):
         return list(class_rgb_values)
     return [c for i, c in enumerate(class_rgb_values) if i != unknown_index]
+
+def _plot_random_superpixel_probabilities(
+    ds_full: "GraphSuperpixelDataset",
+    model_list: List["SPNodeRegressor"],
+    model_labels: List[str],
+    names: List[str],
+    class_rgb_values: List[Tuple[int, int, int]],
+    unknown_index: Optional[int],
+    k_value: int,
+    normalize_node_features: bool,
+    device: torch.device,
+    save_dir: str,
+    show: bool = True,
+    image_index: Optional[int] = None,
+) -> None:
+    """Plots probability histograms for one random superpixel across models."""
+
+    # Choose random image (only from index_map entries) and find a valid sample
+    if image_index is None:
+        rng = random.Random()
+        available_img_indices = sorted({int(im_i) for im_i, _k in ds_full.index_map})
+        if not available_img_indices:
+            print("[plot] dataset index_map is empty")
+            return
+        # Shuffle candidates and try until we can successfully fetch a sample without IndexError
+        candidates = available_img_indices.copy()
+        rng.shuffle(candidates)
+        sample = None
+        sample_idx = None
+        img_idx = None
+        for cand in candidates:
+            # Find a sample index that matches this image and requested k
+            for i, (im_i, k) in enumerate(ds_full.index_map):
+                if int(im_i) == int(cand) and int(k) == int(k_value):
+                    # ensure base_ds has this image index
+                    if 0 <= int(im_i) < len(ds_full.base_ds):
+                        sample_idx = i
+                        img_idx = int(im_i)
+                        break
+            if sample_idx is not None:
+                # Try to retrieve the sample; __getitem__ may still raise if index_map/catalog is inconsistent
+                try:
+                    sample = ds_full[sample_idx]
+                    break
+                except IndexError:
+                    sample_idx = None
+                    img_idx = None
+                    sample = None
+        if sample is None:
+            print(f"[plot] Could not find a valid sample for any image with k={k_value}")
+            return
+    else:
+        # image_index provided: clamp and use it (then find matching sample)
+        img_idx = int(max(0, min(len(ds_full.base_ds) - 1, image_index)))
+        sample_idx = None
+        for i, (im_i, k) in enumerate(ds_full.index_map):
+            if int(im_i) == img_idx and int(k) == int(k_value):
+                sample_idx = i
+                break
+        if sample_idx is None:
+            print(f"[plot] Could not find sample for chosen image index {img_idx} and k={k_value}")
+            return
+        try:
+            sample = ds_full[sample_idx]
+        except IndexError:
+            print(f"[plot] sample index {sample_idx} invalid for dataset; aborting")
+            return
+        
+    x = sample["x"].to(device)
+    if normalize_node_features:
+        x = F.normalize(x, p=2, dim=1)
+    edge_index = sample["edge_index"].to(device)
+
+    # Load image and mask
+    img_t, img_rgb, mask_t = ds_full.base_ds[img_idx]
+    mask_idx = mask_t.numpy().astype(np.int64)
+
+    # Load superpixel map
+    img_path = sample["meta"]["image_path"]
+    k = int(sample["meta"]["k"])
+    x_path, sp_path = ds_full._features_cache_paths_npy(img_path, k, ds_full.base_ds.img_size)
+    if sp_path.exists():
+        sp = np.load(sp_path, mmap_mode='r').astype(np.int64)
+    else:
+        from utils.graph_utils import slic_labels
+        sp = slic_labels(
+            img_rgb,
+            n_segments=k,
+            compactness=ds_full.slic_compactness,
+            sigma=ds_full.slic_sigma,
+            start_label=ds_full.slic_start_label,
+        )
+
+    # Pick one random superpixel
+    num_nodes = x.shape[0]
+    random_node_id = random.randint(0, num_nodes - 1)
+
+    # Extract region mask
+    region_mask = (sp == random_node_id)
+
+    # Get correct label for that node (assuming y in sample)
+    y_true = None
+    if "y" in sample:
+        y_entry = sample["y"][random_node_id]
+        if isinstance(y_entry, torch.Tensor):
+            if y_entry.numel() == 1:
+                y_true = int(y_entry.item())
+            else:
+                y_true = int(torch.argmax(y_entry).item())
+        else:
+            arr = np.asarray(y_entry)
+            if arr.size == 1:
+                y_true = int(arr.item())
+            else:
+                y_true = int(arr.argmax())
+
+    # Get RGB and mask for that region
+    img_rgb_region = np.zeros_like(img_rgb)
+    mask_rgb_region = np.zeros_like(img_rgb)
+    img_rgb_region[region_mask] = img_rgb[region_mask]
+    mask_rgb = _mask_idx_to_rgb(mask_idx, class_rgb_values)
+    mask_rgb_region[region_mask] = mask_rgb[region_mask]
+
+    # Collect probabilities for each model
+    eff_palette = _effective_palette(class_rgb_values, unknown_index)
+    prob_dict = {}
+
+    with torch.inference_mode():
+        for model, label in zip(model_list, model_labels):
+            logits = model(x, edge_index)[random_node_id]  # shape [num_classes]
+            probs = F.softmax(logits, dim=-1).detach().cpu().numpy()
+            prob_dict[label] = probs
+
+    num_classes = len(next(iter(prob_dict.values())))
+
+    # Plot the region and histograms
+    # We'll show: [image | mask | predicted (blue, first model) | true (red) | other model preds...]
+    n_extra_model = max(0, len(prob_dict) - 1)
+    ncols = 4 + n_extra_model
+    plt.figure(figsize=(4 * ncols, 4))
+
+    ax = plt.subplot(1, ncols, 1)
+    ax.imshow(img_rgb_region)
+    ax.set_title(f"Superpixel {random_node_id} (Image)")
+    ax.axis('off')
+
+    ax = plt.subplot(1, ncols, 2)
+    ax.imshow(mask_rgb_region)
+    ax.set_title("Ground Truth Region")
+    ax.axis('off')
+
+    # Build true probability vector (length = num_classes) if available
+    y_true_probs = None
+    if "y" in sample:
+        y_entry = sample["y"][random_node_id]
+        if isinstance(y_entry, torch.Tensor):
+            arr = y_entry.detach().cpu().numpy()
+        else:
+            arr = np.asarray(y_entry)
+        if arr.size == 1:
+            # scalar class index -> one-hot on effective palette
+            y_true_probs = np.zeros(num_classes, dtype=float)
+            try:
+                idx = int(arr.item())
+                # map full palette idx -> effective palette idx (remove unknown_index)
+                if unknown_index is None or unknown_index < 0:
+                    eff_idx = idx
+                else:
+                    if idx == unknown_index:
+                        eff_idx = None
+                    elif idx > unknown_index:
+                        eff_idx = idx - 1
+                    else:
+                        eff_idx = idx
+                if eff_idx is not None and 0 <= eff_idx < num_classes:
+                    y_true_probs[eff_idx] = 1.0
+            except Exception:
+                y_true_probs = np.zeros(num_classes, dtype=float)
+        else:
+            counts = arr.astype(float)
+            if unknown_index is not None and 0 <= unknown_index < counts.size:
+                counts = np.delete(counts, unknown_index)
+            total = counts.sum()
+            if total > 0:
+                y_true_probs = counts / total
+            else:
+                y_true_probs = np.zeros_like(counts)
+
+    # Predicted probs from first model (blue)
+    first_label = next(iter(prob_dict.keys()))
+    pred_probs_first = prob_dict[first_label]
+
+    ax = plt.subplot(1, ncols, 3)
+    ax.bar(range(num_classes), pred_probs_first, color='skyblue')
+    ax.set_title(f"Predicted (blue): {first_label}")
+    ax.set_xlabel("Class index")
+    ax.set_ylabel("Probability")
+    ax.set_ylim(0, 1)
+
+    # True probs (red)
+    ax = plt.subplot(1, ncols, 4)
+    if y_true_probs is not None and y_true_probs.shape[0] == num_classes:
+        ax.bar(range(num_classes), y_true_probs, color='red', alpha=0.8)
+    else:
+        # empty/placeholder if no true distribution available
+        ax.text(0.5, 0.5, "No true distribution\navailable", ha='center', va='center', transform=ax.transAxes)
+    ax.set_title("True (red)")
+    ax.set_xlabel("Class index")
+    ax.set_ylabel("Probability")
+    ax.set_ylim(0, 1)
+
+    # Additional models (if any) shown as predicted-only blue bars
+    if len(prob_dict) > 1:
+        for j, (label, probs) in enumerate(list(prob_dict.items())[1:], start=1):
+            ax = plt.subplot(1, ncols, 4 + j)
+            ax.bar(range(num_classes), probs, color='skyblue')
+            ax.set_title(f"Predicted: {label}")
+            ax.set_xlabel("Class index")
+            ax.set_ylabel("Probability")
+            ax.set_ylim(0, 1)
+
+    # Save and show single figure (avoid duplicate plotting)
+    os.makedirs(save_dir, exist_ok=True)
+    img_stem = Path(sample["meta"]["image_path"]).stem
+    out_path = os.path.join(save_dir, f"superpixel_probs_{img_stem}_k{k}_node{random_node_id}.png")
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches='tight')
+    if show:
+        plt.show()
+    plt.close()
 
 
 def _plot_random_sample_for_k(
