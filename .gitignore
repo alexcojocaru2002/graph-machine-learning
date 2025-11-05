@@ -15,3 +15,7 @@ models/__pycache__/
 2020_mrsiscccnnagnn/
 
 *.pyc
+__pycache__/
+
+.windsurf
+

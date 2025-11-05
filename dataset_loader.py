@@ -8,8 +8,11 @@ from torch.utils.data import Dataset, DataLoader
 from PIL import Image
 from glob import glob
 
+import const
+
+
 class DeepGlobeDataset(Dataset):
-    def __init__(self, data_dir, class_rgb_values, img_size: Optional[tuple[int, int]] = None):
+    def __init__(self, data_dir, class_rgb_values, img_size: Optional[tuple[int, int]] = const.IMG_SIZE):
         self.image_paths = sorted(glob(os.path.join(data_dir, '*_sat.jpg')))
         self.mask_paths  = sorted(glob(os.path.join(data_dir, '*_mask.png')))
         self.class_rgb_values = class_rgb_values
