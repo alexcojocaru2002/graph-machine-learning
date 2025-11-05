@@ -32,4 +32,55 @@ class GCN2(nn.Module):
             "dropout": float(self.dropout),
             "add_self_loops": False,
             "normalize": True,
+            "final_activation": "softmax",
         }
+
+    @staticmethod
+    def load_model(cfg, num_classes_eff: int) -> "GCN2":
+        """
+        Build GCN2 based on checkpoint architecture metadata if available,
+        otherwise fall back to values in cfg. Also loads checkpoint weights if provided.
+        """
+        from pathlib import Path
+        import json
+
+        device = torch.device(getattr(cfg, "device", "cpu"))
+        arch_path = Path(cfg.ckpt_path).with_suffix(".json") if getattr(cfg, "ckpt_path", None) else None
+        arch = None
+        if arch_path is not None and arch_path.exists():
+            with open(arch_path, "r") as f:
+                meta = json.load(f)
+            arch = meta.get("architecture", None)
+
+        if arch is not None:
+            out_dim = arch.get("out_dim", num_classes_eff)
+            if out_dim != num_classes_eff:
+                out_dim = num_classes_eff
+            model = GCN2(
+                in_dim=arch.get("in_dim", getattr(cfg, "in_dim", 1024)),
+                hidden_dim=arch.get("hidden_dim", getattr(cfg, "hidden_dim", 512)),
+                out_dim=out_dim,
+                dropout=arch.get("dropout", getattr(cfg, "dropout", 0.2)),
+            ).to(device)
+        else:
+            # Fallback to cfg values if no architecture metadata
+            model = GCN2(
+                in_dim=getattr(cfg, "in_dim", 1024),
+                hidden_dim=getattr(cfg, "hidden_dim", 512),
+                out_dim=num_classes_eff,
+                dropout=getattr(cfg, "dropout", 0.2),
+            ).to(device)
+
+        # Load checkpoint weights if available
+        ckpt_path = getattr(cfg, "ckpt_path", None)
+        if ckpt_path is not None:
+            ckpt = torch.load(ckpt_path, map_location=device)
+            # Support both full checkpoint dicts and plain state dict files
+            if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
+                state_dict = ckpt["model_state_dict"]
+            else:
+                # Assume it's already a state_dict
+                state_dict = ckpt
+            model.load_state_dict(state_dict, strict=True)
+        model.eval()
+        return model

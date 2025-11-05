@@ -4,6 +4,7 @@ import torch.nn.functional as F
 from torch_geometric.loader import DataLoader as PyGDataLoader
 from pathlib import Path
 import json
+import pandas as pd
 
 import const
 from config.geometric_train_config import GeometricTrainConfig
@@ -43,24 +44,27 @@ def train_one_epoch(model, loader, optimizer, device):
         loss = F.kl_div(F.log_softmax(out, dim=1), data.y, reduction="batchmean")
         optimizer.zero_grad()
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         total_loss += float(loss.item())
         n_graphs += 1
     return total_loss / max(1, n_graphs)
 
-
 def evaluate(model, loader, device):
     model.eval()
     total_loss = 0.0
+    total_mse = 0.0
     n_graphs = 0
     with torch.no_grad():
         for data in loader:
             data = data.to(device)
             out = model(data.x, data.edge_index)
             loss = F.kl_div(F.log_softmax(out, dim=1), data.y, reduction="batchmean")
+            mse = torch.mean((out - data.y) ** 2).item()
             total_loss += float(loss.item())
+            total_mse += mse
             n_graphs += 1
-    return total_loss / max(1, n_graphs)
+    return total_loss / max(1, n_graphs), total_mse / max(1, n_graphs)
 
 def create_split_pyg_loaders(
     config: GeometricTrainConfig,
@@ -179,10 +183,12 @@ def train_model(
 
     best_val = float("inf")
     last_epoch = 0
+    metrics_list = []
     for epoch in range(1, config.epochs + 1):
         print(f"Starting epoch {epoch}")
         train_loss = train_one_epoch(model, train_loader, optimizer, device)
-        val_loss = evaluate(model, val_loader, device)
+        val_loss, val_mse = evaluate(model, val_loader, device)
+        metrics_list.append({'epoch': epoch, 'train_loss': train_loss, 'val_loss': val_loss, 'val_mse': val_mse})
         if val_loss < best_val:
             best_val = val_loss
             save_checkpoint_and_sidecar(
@@ -195,7 +201,9 @@ def train_model(
                 val_image_ids=val_image_ids,
             )
             torch.save(model.state_dict(), best_weights)
-        print(f"Epoch {epoch:03d} | train {train_loss:.4f} | val {val_loss:.4f} | best {best_val:.4f}")
+        print(f"Epoch {epoch:03d} | train {train_loss:.4f} | val {val_loss:.4f} | mse {val_mse:.6f} | best {best_val:.4f}")
+        if epoch % 10 == 0:
+            pd.DataFrame(metrics_list).to_csv(ckpt_dir / f"{config.model_name}_metrics.csv", index=False)
         last_epoch = epoch
 
     save_checkpoint_and_sidecar(
@@ -207,7 +215,7 @@ def train_model(
         config=config,
         val_image_ids=val_image_ids,
     )
-
+    pd.DataFrame(metrics_list).to_csv(ckpt_dir / f"{config.model_name}_metrics.csv", index=False)
     return best_val
 
 def get_device():
