@@ -10,6 +10,7 @@ class MultiheadGAT(nn.Module):
     - Each block is a GATConv with 'heads=num_heads' and 'concat=True'.
     - After each block: activation -> BatchNorm1d.
     - Representations across layers are SUMed, followed by a Linear projection (fusion).
+    - Outputs probabilities via softmax activation (for area fraction prediction).
     """
 
     def __init__(
@@ -117,3 +118,50 @@ class MultiheadGAT(nn.Module):
             "use_batchnorm": bool(self.use_batchnorm),
             "final_activation": None,
         }
+
+    @staticmethod
+    def load_model(cfg, num_classes_eff: int) -> "MultiheadGAT":
+        """
+        Build MultiheadGAT based on checkpoint  architecture metadata
+        """
+        from pathlib import Path  # local import to avoid global dependency
+        import json  # local import to avoid global dependency
+
+        device = torch.device(getattr(cfg, "device", "cpu"))
+        arch_path = Path(cfg.ckpt_path).with_suffix(".json") if getattr(cfg, "ckpt_path", None) else None
+        arch = None
+        if arch_path is not None and arch_path.exists():
+            with open(arch_path, "r") as f:
+                meta = json.load(f)
+            arch = meta.get("architecture", None)
+
+        if arch is not None:
+            out_dim = arch.get("out_dim", num_classes_eff)
+            if out_dim != num_classes_eff:
+                out_dim = num_classes_eff
+            model = MultiheadGAT(
+                in_dim=arch.get("in_dim", getattr(cfg, "in_dim", 1024)),
+                hidden_dim=arch.get("hidden_dim", getattr(cfg, "hidden_dim", 512)),
+                out_dim=out_dim,
+                num_layers=arch.get("num_layers", getattr(cfg, "num_layers", 2)),
+                num_heads=arch.get("num_heads", getattr(cfg, "num_heads", 3)),
+                dropout=arch.get("dropout", getattr(cfg, "gat_dropout", 0.2)),
+                integrate_dropout=arch.get("integrate_dropout", getattr(cfg, "integrate_dropout", 0.2)),
+                activation=arch.get("activation", "relu"),
+                add_self_loops=arch.get("add_self_loops", False),
+                use_batchnorm=arch.get("use_batchnorm", True),
+            ).to(device)
+
+        # Load checkpoint weights if available
+        ckpt_path = getattr(cfg, "ckpt_path", None)
+        if ckpt_path is not None:
+            ckpt = torch.load(ckpt_path, map_location=device)
+            # Support both full checkpoint dicts and plain state dict files
+            if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
+                state_dict = ckpt["model_state_dict"]
+            else:
+                # Assume it's already a state_dict
+                state_dict = ckpt
+            model.load_state_dict(state_dict, strict=True)
+        model.eval()
+        return model

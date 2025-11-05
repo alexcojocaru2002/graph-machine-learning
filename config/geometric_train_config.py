@@ -7,7 +7,7 @@ class GeometricTrainConfig:
     lr: float = 2e-4
     weight_decay: float = 1e-4
     k_values: list[int] = [60]
-    batch_size: int = 1
+    batch_size: int = 32
 
-    train_workers = 1
-    val_workers = 1
+    train_workers = 8
+    val_workers = 4
