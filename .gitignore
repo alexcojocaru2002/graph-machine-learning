@@ -1,7 +1,8 @@
 .idea
 data/
 glob
-datasets/__pycache__/
+datasets/__pycache__/*
+
 
 artifacts/
 
@@ -13,4 +14,4 @@ models/__pycache__/
 
 2020_mrsiscccnnagnn/
 
-__pycache__/
+*.pyc
