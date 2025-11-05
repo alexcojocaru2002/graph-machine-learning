@@ -20,7 +20,6 @@ except Exception:
     from torch.cuda.amp import autocast as torch_autocast, GradScaler as TorchGradScaler
 
 from load_palette import load_class_palette
-from datasets.graph_superpixel_dataset import GraphSuperpixelDataset
 from models.gat import SPNodeRegressor
 from torchvision.models import vgg16, VGG16_Weights
 from utils.logger import TrainLogger
