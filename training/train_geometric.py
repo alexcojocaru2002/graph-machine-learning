@@ -97,8 +97,10 @@ def train_one_epoch(model, loader, optimizer, device):
     n_graphs = 0
     for data in loader:
         data = data.to(device)
-        x = data.x 
-        out = model(x, data.edge_index)
+        try:
+            out = model(data.x, data.edge_index)
+        except TypeError:
+            out = model(data.x)
         # loss = F.kl_div(F.log_softmax(out, dim=1), data.y, reduction="batchmean")
         loss = kl_loss_area(out, data.y)
         optimizer.zero_grad()
@@ -117,8 +119,11 @@ def evaluate(model, loader, device):
     with torch.no_grad():
         for data in loader:
             data = data.to(device)
-            x = data.x 
-            out = model(x, data.edge_index)
+            x = data.x
+            try:
+                out = model(data.x, data.edge_index)
+            except TypeError:
+                out = model(data.x)
             # loss = F.kl_div(F.log_softmax(out, dim=1), data.y, reduction="batchmean")
             loss = kl_loss_area(out, data.y)
             mse = torch.mean((F.softmax(out, dim=1) - data.y) ** 2).item()
