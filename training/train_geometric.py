@@ -34,14 +34,39 @@ def geometric_training_entrypoint(model: torch.nn.Module, config: GeometricTrain
 
     print("Done.")
 
+def kl_loss_area(pred_logits: torch.Tensor, target_probs: torch.Tensor) -> torch.Tensor:
+    """
+    KL(target || softmax(logits)) averaged over VALID nodes only.
+
+    - Masks out superpixels with zero mass after excluding the unknown class
+      (i.e., rows where sum(target_probs)==0), since they carry no training signal.
+    - Renormalizes valid target rows to sum exactly to 1 to ensure a proper distribution.
+    """
+    with torch.no_grad():
+        row_sum = target_probs.sum(dim=-1, keepdim=True)
+        valid_mask = (row_sum.squeeze(-1) > 0)
+
+    if not torch.any(valid_mask):
+        return pred_logits.sum() * 0.0  # zero loss if no valid nodes
+
+    # Select only valid rows and renormalize to form exact distributions
+    target_valid = target_probs[valid_mask]
+    row_sum_valid = row_sum[valid_mask]
+    target_valid = target_valid / row_sum_valid
+
+    log_pred_valid = F.log_softmax(pred_logits[valid_mask], dim=-1)
+    return F.kl_div(log_pred_valid, target_valid, reduction="batchmean")
+
 def train_one_epoch(model, loader, optimizer, device):
     model.train()
     total_loss = 0.0
     n_graphs = 0
     for data in loader:
         data = data.to(device)
-        out = model(data.x, data.edge_index)
-        loss = F.kl_div(F.log_softmax(out, dim=1), data.y, reduction="batchmean")
+        x = data.x 
+        out = model(x, data.edge_index)
+        # loss = F.kl_div(F.log_softmax(out, dim=1), data.y, reduction="batchmean")
+        loss = kl_loss_area(out, data.y)
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -58,9 +83,11 @@ def evaluate(model, loader, device):
     with torch.no_grad():
         for data in loader:
             data = data.to(device)
-            out = model(data.x, data.edge_index)
-            loss = F.kl_div(F.log_softmax(out, dim=1), data.y, reduction="batchmean")
-            mse = torch.mean((out - data.y) ** 2).item()
+            x = data.x 
+            out = model(x, data.edge_index)
+            # loss = F.kl_div(F.log_softmax(out, dim=1), data.y, reduction="batchmean")
+            loss = kl_loss_area(out, data.y)
+            mse = torch.mean((F.softmax(out[0]) - data.y) ** 2).item()
             total_loss += float(loss.item())
             total_mse += mse
             n_graphs += 1
@@ -174,7 +201,7 @@ def train_model(
     Generic training routine for PyG models using KL-div loss on soft targets.
     Saves best and last checkpoints under `artifacts/` using the model class name.
     """
-    optimizer = torch.optim.Adam(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
     ckpt_dir = const.ARTIFACTS_DIR
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     best_ckpt = ckpt_dir / f"{config.model_name}_best.ckpt"

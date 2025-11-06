@@ -10,6 +10,7 @@ import const
 from dataset_loader import DeepGlobeDataset
 from datasets.superpixel_graph_dataset_v2 import SuperpixelGraphDatasetV2
 from models.gcn import GCN2
+from models.gat_geometric import MultiheadGAT
 from skimage.segmentation import find_boundaries
 
 
@@ -75,7 +76,7 @@ def highlight_superpixel(sp, sp_id, color=(255, 0, 0), alpha=0.5):
 def main():
     # Config
     device = torch.device("mps" if torch.mps.is_available() else "cpu")
-    ckpt_path = "/Users/avisoiu/git_tree/graph-machine-learning/artifacts/gcn2_k60_best.ckpt"
+    ckpt_path = "D:/Work/graph-machine-learning/artifacts/gat_k60_last.ckpt"
     k_value = 60
     random_seed = 42
     
@@ -142,7 +143,7 @@ def main():
     cfg.ckpt_path = ckpt_path
     cfg.device = device
     
-    model = GCN2.load_model(cfg, num_classes_eff=num_classes)
+    model = MultiheadGAT.load_model(cfg, num_classes_eff=num_classes)
     model = model.to(device)
     print(f"Model loaded successfully! Output classes: {num_classes} (unknown excluded)")
     
@@ -176,6 +177,7 @@ def main():
     selected_sps = [
         ("Best (Lowest MSE)", best_sp_idx, mse_per_sp[best_sp_idx], 'green'),
         ("Median MSE", median_sp_idx, mse_per_sp[median_sp_idx], 'yellow'),
+
         ("Worst (Highest MSE)", worst_sp_idx, mse_per_sp[worst_sp_idx], 'red'),
     ]
     

@@ -68,5 +68,7 @@ def get_slic_graph(
     X = torch.full((N, C), -float("inf"), dtype=F_flat.dtype, device=cpu)
     X.scatter_reduce_(0, index, F_flat, reduce='amax', include_self=True)
     X[~torch.isfinite(X)] = 0.0  # handle empty segments if any
+    
+    X = F.normalize(X, p=2, dim=1) # Normalize node features from train.py
 
     return X, compute_edge_index_from_superpixels(sp, rgb=img_rgb), sp

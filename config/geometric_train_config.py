@@ -1,6 +1,6 @@
 class GeometricTrainConfig:
     random_seed: int = 42
-    epochs: int = 20
+    epochs: int = 50
     model_name: str
     hidden_dim: int = 512
     img_size: int = (512, 512)
@@ -9,5 +9,5 @@ class GeometricTrainConfig:
     k_values: list[int] = [60]
     batch_size: int = 32
 
-    train_workers = 8
-    val_workers = 4
+    train_workers = 2
+    val_workers = 2
