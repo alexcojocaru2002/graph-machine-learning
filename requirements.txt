@@ -10,5 +10,4 @@ wandb
 pillow
 matplotlib
 torch_geometric
-# Optional GPU SLIC acceleration via cuCIM (fallback to CPU if unavailable)
-cucim; platform_system == "Linux"
+kagglehub

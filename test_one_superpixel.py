@@ -54,18 +54,18 @@ def get_superpixel_predictions(model, data, device):
     return pred_probs.cpu().numpy()
 
 
-def calculate_mse_per_superpixel(pred, gt):
-    """Calculate MSE loss per superpixel.
+def calculate_rmse_per_superpixel(pred, gt):
+    """Calculate RMSE loss per superpixel.
     
     Args:
         pred: [N, num_classes] predicted area fractions
         gt: [N, num_classes] ground truth area fractions
     
     Returns:
-        mse_per_sp: [N] MSE for each superpixel
+        rmse_per_sp: [N] RMSE for each superpixel
     """
-    mse_per_sp = np.mean((pred - gt) ** 2, axis=1)  # [N]
-    return mse_per_sp
+    rmse_per_sp = np.sqrt(np.mean((pred - gt) ** 2, axis=1))  # [N]
+    return rmse_per_sp
 
 
 def highlight_superpixel(sp, sp_id, color=(255, 0, 0), alpha=0.5):
@@ -77,7 +77,7 @@ def highlight_superpixel(sp, sp_id, color=(255, 0, 0), alpha=0.5):
 def main():
     # Config
     device = torch.device("mps" if torch.mps.is_available() else "cpu")
-    ckpt_path = "D:/Work/graph-machine-learning/artifacts/gat_k60_best.ckpt"
+    ckpt_path = const.ARTIFACTS_DIR / "gat_k60_best.ckpt"
     k_value = 60
     random_seed = 42
     
@@ -162,29 +162,29 @@ def main():
     print(f"\nPredictions shape: {pred_fractions.shape} (unknown class excluded)")
     print(f"Ground truth shape: {gt_fractions.shape} (unknown class excluded)")
     
-    # Calculate MSE per superpixel
-    mse_per_sp = calculate_mse_per_superpixel(pred_fractions, gt_fractions)
-    mean_mse = np.mean(mse_per_sp)
+    # Calculate RMSE per superpixel
+    rmse_per_sp = calculate_rmse_per_superpixel(pred_fractions, gt_fractions)
+    mean_rmse = np.mean(rmse_per_sp)
     
-    print(f"\nMean MSE across all superpixels: {mean_mse:.6f}")
-    print(f"MSE range: [{mse_per_sp.min():.6f}, {mse_per_sp.max():.6f}]")
+    print(f"\nMean RMSE across all superpixels: {mean_rmse:.6f}")
+    print(f"RMSE range: [{rmse_per_sp.min():.6f}, {rmse_per_sp.max():.6f}]")
     
-    # Select interesting superpixels: best, worst, and median MSE
-    sorted_indices = np.argsort(mse_per_sp)
+    # Select interesting superpixels: best, worst, and median RMSE
+    sorted_indices = np.argsort(rmse_per_sp)
     best_sp_idx = sorted_indices[0]
     worst_sp_idx = sorted_indices[-1]
     median_sp_idx = sorted_indices[len(sorted_indices) // 2]
     
     selected_sps = [
-        ("Best (Lowest MSE)", best_sp_idx, mse_per_sp[best_sp_idx], 'green'),
-        ("Median MSE", median_sp_idx, mse_per_sp[median_sp_idx], 'yellow'),
+        ("Best (Lowest RMSE)", best_sp_idx, rmse_per_sp[best_sp_idx], 'green'),
+        ("Median RMSE", median_sp_idx, rmse_per_sp[median_sp_idx], 'yellow'),
 
-        ("Worst (Highest MSE)", worst_sp_idx, mse_per_sp[worst_sp_idx], 'red'),
+        ("Worst (Highest RMSE)", worst_sp_idx, rmse_per_sp[worst_sp_idx], 'red'),
     ]
     
     print(f"\nSelected superpixels for visualization:")
-    for name, idx, mse_val, _ in selected_sps:
-        print(f"  {name}: SP#{idx}, MSE={mse_val:.6f}")
+    for name, idx, rmse_val, _ in selected_sps:
+        print(f"  {name}: SP#{idx}, RMSE={rmse_val:.6f}")
     
     # Create visualizations
     fig = plt.figure(figsize=(20, 12))
@@ -198,7 +198,7 @@ def main():
     
     # Overlay each selected superpixel
     colors_map = {'green': (0, 1, 0), 'yellow': (1, 1, 0), 'red': (1, 0, 0)}
-    for i, (name, sp_idx, mse_val, color) in enumerate(selected_sps):
+    for i, (name, sp_idx, rmse_val, color) in enumerate(selected_sps):
         mask = (sp == sp_idx)
         overlay_color = colors_map[color]
         for c in range(3):
@@ -219,12 +219,12 @@ def main():
     img_display[borders] = [1, 1, 1]  # white borders
     
     ax_img.imshow(img_display)
-    ax_img.set_title(f"Highlighted Superpixels (K={k}, Total={data.meta['num_nodes']}, Mean MSE={mean_mse:.6f})",
+    ax_img.set_title(f"Highlighted Superpixels (K={k}, Total={data.meta['num_nodes']}, Mean RMSE={mean_rmse:.6f})",
                     fontsize=14, fontweight='bold')
     ax_img.axis('off')
     
     # Rows 2-3: Bar charts for each selected superpixel
-    for i, (name, sp_idx, mse_val, color) in enumerate(selected_sps):
+    for i, (name, sp_idx, rmse_val, color) in enumerate(selected_sps):
         ax = fig.add_subplot(gs[(i // 2) + 1, (i % 2) * 2: (i % 2) * 2 + 2])
         
         x = np.arange(num_classes)  # All classes (unknown already excluded)
@@ -238,7 +238,7 @@ def main():
         
         ax.set_xlabel('Class (Unknown Excluded)', fontsize=11)
         ax.set_ylabel('Area Fraction', fontsize=11)
-        ax.set_title(f"{i+1}. {name} (SP#{sp_idx}, MSE={mse_val:.6f})",
+        ax.set_title(f"{i+1}. {name} (SP#{sp_idx}, RMSE={rmse_val:.6f})",
                     fontsize=12, fontweight='bold', color=color)
         ax.set_xticks(x)
         ax.set_xticklabels(class_names_no_unknown, rotation=45, ha='right', fontsize=9)
@@ -257,17 +257,17 @@ def main():
     
     # Print detailed statistics
     print(f"\n" + "="*60)
-    print(f"REGRESSION METRICS (MSE Loss) - Unknown Class Excluded")
+    print(f"REGRESSION METRICS (RMSE Loss) - Unknown Class Excluded")
     print("="*60)
-    print(f"Mean MSE: {mean_mse:.6f}")
-    print(f"Std MSE:  {np.std(mse_per_sp):.6f}")
-    print(f"Min MSE:  {mse_per_sp.min():.6f}")
-    print(f"Max MSE:  {mse_per_sp.max():.6f}")
+    print(f"Mean RMSE: {mean_rmse:.6f}")
+    print(f"Std RMSE:  {np.std(rmse_per_sp):.6f}")
+    print(f"Min RMSE:  {rmse_per_sp.min():.6f}")
+    print(f"Max RMSE:  {rmse_per_sp.max():.6f}")
     print(f"\nDetailed breakdown for selected superpixels:")
     print(f"Classes: {class_names_no_unknown}")
-    for i, (name, sp_idx, mse_val, _) in enumerate(selected_sps):
+    for i, (name, sp_idx, rmse_val, _) in enumerate(selected_sps):
         print(f"\n{i+1}. {name} (SP#{sp_idx}):")
-        print(f"   MSE: {mse_val:.6f}")
+        print(f"   RMSE: {rmse_val:.6f}")
         print(f"   GT fractions:   {[f'{v:.4f}' for v in gt_fractions[sp_idx]]}")
         print(f"   Pred fractions: {[f'{v:.4f}' for v in pred_fractions[sp_idx]]}")
 

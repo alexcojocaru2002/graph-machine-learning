@@ -16,6 +16,7 @@ def geometric_training_entrypoint(model: torch.nn.Module, config: GeometricTrain
     torch.manual_seed(config.random_seed)
     np.random.seed(config.random_seed)
     device = get_device()
+    print(f"Using device: {device}")
 
     (train_ds, train_loader), (val_ds, val_loader), val_ids = create_split_pyg_loaders(
         config, device, train_ratio=0.8
