@@ -50,7 +50,8 @@ def get_superpixel_predictions(model, data, device):
     with torch.no_grad():
         data = data.to(device)
         preds = model(data.x, data.edge_index)  # [N, num_classes] area fractions
-    return preds.cpu().numpy()
+        pred_probs = torch.softmax(preds, dim=-1)  # convert logits → probabilities
+    return pred_probs.cpu().numpy()
 
 
 def calculate_mse_per_superpixel(pred, gt):
@@ -76,7 +77,7 @@ def highlight_superpixel(sp, sp_id, color=(255, 0, 0), alpha=0.5):
 def main():
     # Config
     device = torch.device("mps" if torch.mps.is_available() else "cpu")
-    ckpt_path = "D:/Work/graph-machine-learning/artifacts/gat_k60_last.ckpt"
+    ckpt_path = "D:/Work/graph-machine-learning/artifacts/gat_k60_best.ckpt"
     k_value = 60
     random_seed = 42
     

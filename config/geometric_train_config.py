@@ -2,7 +2,7 @@ class GeometricTrainConfig:
     random_seed: int = 42
     epochs: int = 50
     model_name: str
-    hidden_dim: int = 512
+    hidden_dim: int = 128
     img_size: int = (512, 512)
     lr: float = 2e-4
     weight_decay: float = 1e-4

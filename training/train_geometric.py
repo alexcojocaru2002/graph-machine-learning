@@ -34,6 +34,39 @@ def geometric_training_entrypoint(model: torch.nn.Module, config: GeometricTrain
 
     print("Done.")
 
+def test_model(model: torch.nn.Module, config: GeometricTrainConfig):
+    torch.manual_seed(config.random_seed)
+    np.random.seed(config.random_seed)
+    device = get_device()
+
+    # use same split logic; val acts as test
+    (_, _), (test_ds, test_loader), test_ids = create_split_pyg_loaders(
+        config, device, train_ratio=0.8
+    )
+
+    ckpt_path = const.ARTIFACTS_DIR / f"{config.model_name}_best_weights.pt"
+    if not ckpt_path.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+
+    model = model.to(device)
+    model.load_state_dict(torch.load(ckpt_path, map_location=device))
+    model.eval()
+
+    test_loss, test_mse = evaluate(model, test_loader, device)
+
+    print(f"Model: {config.model_name}")
+    print(f"Test Loss: {test_loss:.4f} | Test MSE: {test_mse:.6f}")
+
+    results = {
+        "model": config.model_name,
+        "test_loss": test_loss,
+        "test_mse": test_mse,
+    }
+    out_path = const.ARTIFACTS_DIR / f"{config.model_name}_test_results.csv"
+    pd.DataFrame([results]).to_csv(out_path, index=False)
+    print(f"Saved results to {out_path}")
+    return results
+
 def kl_loss_area(pred_logits: torch.Tensor, target_probs: torch.Tensor) -> torch.Tensor:
     """
     KL(target || softmax(logits)) averaged over VALID nodes only.
@@ -87,7 +120,7 @@ def evaluate(model, loader, device):
             out = model(x, data.edge_index)
             # loss = F.kl_div(F.log_softmax(out, dim=1), data.y, reduction="batchmean")
             loss = kl_loss_area(out, data.y)
-            mse = torch.mean((F.softmax(out[0]) - data.y) ** 2).item()
+            mse = torch.mean((F.softmax(out, dim=1) - data.y) ** 2).item()
             total_loss += float(loss.item())
             total_mse += mse
             n_graphs += 1
