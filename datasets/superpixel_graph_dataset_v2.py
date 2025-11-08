@@ -49,10 +49,12 @@ class SuperpixelGraphDatasetV2(Dataset):
         for d in (self.fm_dir, self.graph_dir, self.tgt_dir):
             d.mkdir(parents=True, exist_ok=True)
 
-        # Build (image_idx, k) index map, optionally filtered by image indices
+        # Build (image_idx, k) index map: each image gets 2 randomly selected k values
         self.index_map: List[Tuple[int, int]] = []
+        rng = np.random.default_rng(seed=42)
         for i in range(len(self.base)):
-            for k in self.k_values:
+            k_selected = rng.choice(self.k_values, size=2, replace=False)
+            for k in k_selected:
                 self.index_map.append((i, k))
 
         # Simple in-process cache for per-image CNN feature maps to avoid recomputation across K in the same process
@@ -103,7 +105,12 @@ class SuperpixelGraphDatasetV2(Dataset):
         key = self._image_key(image_idx)
         fm_path = self.fm_dir / f"{key}_fm.pt"
         if fm_path.exists():
-            Fm = torch.load(fm_path, map_location="cpu")
+            try:
+                Fm = torch.load(fm_path, map_location="cpu")
+            except (EOFError, RuntimeError, ValueError):
+                print(f"Warning: Corrupted feature map cache for {key}, regenerating...")
+                Fm = extract_image_feature_map(img_t, device=self.device)
+                torch.save(Fm.cpu(), fm_path)
         else:
             Fm = extract_image_feature_map(img_t, device=self.device)
             torch.save(Fm.cpu(), fm_path)
@@ -117,16 +124,21 @@ class SuperpixelGraphDatasetV2(Dataset):
         ei_path = self.graph_dir / f"{key}_k{k}_edge_index.pt"
         x_path = self.graph_dir / f"{key}_k{k}_X.pt"
         if sp_path.exists() and ei_path.exists() and x_path.exists():
-            sp = np.load(sp_path)
-            edge_index = torch.load(ei_path, map_location="cpu")
-            X = torch.load(x_path, map_location="cpu")
-            return X, edge_index, sp
-        else:
-            X, edge_index, sp = get_slic_graph(Fm, img_rgb, k=k, device=self.device)
-            np.save(sp_path, sp)
-            torch.save(edge_index.cpu(), ei_path)
-            torch.save(X.cpu(), x_path)
-            return X, edge_index, sp
+            try:
+                sp = np.load(sp_path)
+                edge_index = torch.load(ei_path, map_location="cpu")
+                X = torch.load(x_path, map_location="cpu")
+                return X, edge_index, sp
+            except (EOFError, RuntimeError, ValueError) as e:
+                # Corrupted cache file, regenerate
+                print(f"Warning: Corrupted cache for {key}_k{k}, regenerating...")
+                pass
+        # Generate new graph
+        X, edge_index, sp = get_slic_graph(Fm, img_rgb, k=k, device=self.device)
+        np.save(sp_path, sp)
+        torch.save(edge_index.cpu(), ei_path)
+        torch.save(X.cpu(), x_path)
+        return X, edge_index, sp
 
     def _load_targets(self, image_idx: int, k: int, sp: np.ndarray, mask_t: torch.Tensor) -> torch.Tensor:
         key = self._image_key(image_idx)
@@ -135,7 +147,11 @@ class SuperpixelGraphDatasetV2(Dataset):
         unk = -1 if self.unknown_index is None else int(self.unknown_index)
         y_path = self.tgt_dir / f"{key}_k{k}_C{num_classes}_unk{unk}_n{norm_flag}.pt"
         if y_path.exists():
-            return torch.load(y_path, map_location="cpu")
+            try:
+                return torch.load(y_path, map_location="cpu")
+            except (EOFError, RuntimeError, ValueError):
+                print(f"Warning: Corrupted target cache for {key}_k{k}, regenerating...")
+                pass
         y = compute_superpixel_area_targets(
             sp=sp,
             mask=mask_t.numpy().astype(np.int64),
