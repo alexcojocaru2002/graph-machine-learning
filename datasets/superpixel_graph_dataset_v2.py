@@ -53,7 +53,10 @@ class SuperpixelGraphDatasetV2(Dataset):
         self.index_map: List[Tuple[int, int]] = []
         rng = np.random.default_rng(seed=42)
         for i in range(len(self.base)):
-            k_selected = rng.choice(self.k_values, size=2, replace=False)
+            if len(self.k_values) >= 2:
+                k_selected = rng.choice(self.k_values, size=2, replace=False)
+            else:
+                k_selected = [self.k_values[0]]
             for k in k_selected:
                 self.index_map.append((i, k))
 
