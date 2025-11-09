@@ -6,10 +6,10 @@ from explanation.explain_geometric import geometric_explainer_entrypoint
 
 def run_all_models():
     models = [
-        (GCN2, "gcn2_k60", [60], None),
-        (GCN2, "gcn2_k60_k120_k300_k500_multi", [60, 120, 300, 500], None),
-        (MultiheadGAT, "gat_k60", [60], 512),
-        (MultiheadGAT, "gat_k60_k120_k300_k500_multi", [60, 120, 300, 500], 512),
+        (GCN2, "gcn2_k60", [600], None),
+        (GCN2, "gcn2_k60_k120_k300_k500_multi", [600], None),
+        (MultiheadGAT, "gat_k60", [600], 512),
+        (MultiheadGAT, "gat_k60_k120_k300_k500_multi", [600], 512),
     ]
 
     for model_class, model_name, k_values, hidden_dim_override in models:
