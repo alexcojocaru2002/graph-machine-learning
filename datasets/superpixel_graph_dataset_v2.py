@@ -4,7 +4,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from torch.utils.data import Dataset, Subset
-from torch_geometric.data import Data
+from torch_geometric.data import Data  # type: ignore[import]
 
 import const
 from dataset_loader import DeepGlobeDataset
@@ -20,7 +20,7 @@ class SuperpixelGraphDatasetV2(Dataset):
       - y: [N, C_eff] (area fractions if normalize_targets=True)
     Feature extractor pipeline:
       1) extract_image_feature_map(img_t)
-      2) extract_features(feature_map, img_rgb, k) -> (X, edge_index, sp)
+      2) get_slic_graph(feature_map, img_rgb, k) -> (X, edge_index, sp)
       3) compute_superpixel_area_targets(sp, mask)
     """
 
@@ -32,6 +32,7 @@ class SuperpixelGraphDatasetV2(Dataset):
         unknown_index: Optional[int],
         normalize_targets: bool = True,
         device: str | torch.device = "cpu",
+        samples_per_image: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.base = base
@@ -40,6 +41,7 @@ class SuperpixelGraphDatasetV2(Dataset):
         self.unknown_index = unknown_index
         self.normalize_targets = normalize_targets
         self.device = torch.device(device)
+        self.samples_per_image = samples_per_image
 
         # Cache directories
         self.cache_root = Path(const.CACHE_DIR)
@@ -49,11 +51,23 @@ class SuperpixelGraphDatasetV2(Dataset):
         for d in (self.fm_dir, self.graph_dir, self.tgt_dir):
             d.mkdir(parents=True, exist_ok=True)
 
-        # Build (image_idx, k) index map: each image gets 2 randomly selected k values
+        # Build (image_idx, k) index map: select a subset of K values per image deterministically w.r.t. RNG seed.
         self.index_map: List[Tuple[int, int]] = []
         rng = np.random.default_rng(seed=42)
+        if len(self.k_values) == 0:
+            raise ValueError("k_values must contain at least one entry.")
+        if self.samples_per_image is None:
+            default_samples = 2
+            self.samples_per_image = default_samples if len(self.k_values) >= default_samples else len(self.k_values)
+        if self.samples_per_image <= 0:
+            raise ValueError("samples_per_image must be positive.")
         for i in range(len(self.base)):
-            k_selected = rng.choice(self.k_values, size=2, replace=False)
+            if self.samples_per_image >= len(self.k_values):
+                k_selected = list(self.k_values)
+            else:
+                k_selected = rng.choice(
+                    self.k_values, size=self.samples_per_image, replace=False
+                )
             for k in k_selected:
                 self.index_map.append((i, k))
 

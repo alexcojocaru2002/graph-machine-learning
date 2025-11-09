@@ -177,7 +177,7 @@ def create_split_pyg_loaders(
         shuffle=True,
         num_workers=config.train_workers,
         persistent_workers=True,
-        pin_memory=pin_mem,
+        pin_memory=False,
         prefetch_factor=2
     )
     val_loader = PyGDataLoader(
@@ -185,7 +185,7 @@ def create_split_pyg_loaders(
         batch_size=config.batch_size,
         num_workers=config.val_workers,
         persistent_workers=True,
-        pin_memory=pin_mem,
+        pin_memory=False,
         prefetch_factor=2
     )
 
