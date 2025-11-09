@@ -20,7 +20,7 @@ class SuperpixelGraphDatasetV2(Dataset):
       - y: [N, C_eff] (area fractions if normalize_targets=True)
     Feature extractor pipeline:
       1) extract_image_feature_map(img_t)
-      2) extract_features(feature_map, img_rgb, k) -> (X, edge_index, sp)
+      2) get_slic_graph(feature_map, img_rgb, k) -> (X, edge_index, sp)
       3) compute_superpixel_area_targets(sp, mask)
     """
 
