@@ -119,26 +119,26 @@ def geometric_explainer_entrypoint(
         )
     )
 
-    # graph explanation - we could remove this 
-    explanation = explainer(x=data.x, edge_index=data.edge_index, index=node_idx)
-    node_importance = explanation.node_mask.detach().cpu().numpy()  # [N]
+    # # graph explanation - we could remove this 
+    # explanation = explainer(x=data.x, edge_index=data.edge_index, index=node_idx)
+    # node_importance = explanation.node_mask.detach().cpu().numpy()  # [N]
 
     sp_map = val_ds._load_graph(0, data.x, data.meta.get("img_rgb"), k=config.k_values[0])[2]
     img_rgb = data.meta.get("img_rgb")
     if img_rgb is None:
         img_rgb = val_ds.base[0][1]
 
-    heatmap = np.zeros_like(sp_map, dtype=float)
-    for i, score in enumerate(node_importance):
-        heatmap[sp_map == i] = score
-    heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
+    # heatmap = np.zeros_like(sp_map, dtype=float)
+    # for i, score in enumerate(node_importance):
+    #     heatmap[sp_map == i] = score
+    # heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-8)
 
-    plt.figure(figsize=(10, 10))
-    plt.imshow(img_rgb)
-    plt.imshow(heatmap, cmap='jet', alpha=0.5)
-    plt.axis('off')
-    plt.title(f"Node Importance Heatmap: {val_image_id}")
-    plt.show()
+    # plt.figure(figsize=(10, 10))
+    # plt.imshow(img_rgb)
+    # plt.imshow(heatmap, cmap='jet', alpha=0.5)
+    # plt.axis('off')
+    # plt.title(f"Node Importance Heatmap: {val_image_id}")
+    # plt.show()
 
     # -explanation for a single node (superpixel)
     target_superpixel_idx = 0
@@ -172,15 +172,15 @@ def geometric_explainer_entrypoint(
         plt.imshow(img_rgb)
 
         # heatmap overlay: red -> most important ; blue -> least important
-        plt.imshow(target_heatmap, cmap='jet', alpha=0.5)
+        plt.imshow(target_heatmap, cmap='jet', alpha=0.4)
 
         # we make the target superpixel neon green
         green_overlay = np.zeros((*sp_map.shape, 4), dtype=float)  # RGBA
-        green_overlay[target_mask] = [0.0, 1.0, 0.0, 1.0]  
-        plt.imshow(green_overlay)
+        green_overlay[target_mask] = [0.0, 1.0, 0.0, 0.3]
+        plt.imshow(green_overlay)  
 
         plt.axis('off')
-        plt.title(f"Target Superpixel {target_superpixel_idx} Influence Heatmap: {val_image_id}")
+        plt.title(f"Target superpixel <{target_superpixel_idx}> influence heatmap ({val_image_id})")
         plt.show()
 
-        return heatmap, node_importance, target_heatmap, target_node_importance, val_image_id
+        return target_heatmap, target_node_importance, val_image_id
