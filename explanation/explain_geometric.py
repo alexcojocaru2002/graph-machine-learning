@@ -191,7 +191,7 @@ def geometric_explainer_entrypoint(
         print(f"[INFO] Saved explanation heatmap to {save_path}")
 
 
-        plt.show()
+        # plt.show()
         plt.close()
 
         return target_heatmap, target_node_importance, val_image_id
