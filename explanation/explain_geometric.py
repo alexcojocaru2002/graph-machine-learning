@@ -166,6 +166,8 @@ def geometric_explainer_entrypoint(
 
         # separate mask for target superpixel
         target_mask = sp_map == target_superpixel_idx
+        target_heatmap[target_mask] = 0.0
+
 
         # plot original image
         plt.figure(figsize=(10, 10))
