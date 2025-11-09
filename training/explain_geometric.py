@@ -44,9 +44,9 @@ def geometric_explainer_entrypoint(
     config: GeometricTrainConfig,
     model: Optional[torch.nn.Module] = None,
     val_image_limit: int = 1,
-    node_idx: Optional[int] = None,   # None = explain all nodes
+    node_idx: Optional[int] = None,   # all nodes
     explain_epochs: int = 200,
-    target_superpixel_idx: Optional[int] = None,  # NEW: single-node explanation
+    target_superpixel_idx: Optional[int] = None,  
 ):
     """
     Generates a heatmap of node importance for the first validation image.
@@ -55,7 +55,7 @@ def geometric_explainer_entrypoint(
 
     device = get_device()
 
-    # Load model and metadata
+    # load model and metadata
     meta_path = const.ARTIFACTS_DIR / f"{config.model_name}_best.json"
     ckpt_weights = const.ARTIFACTS_DIR / f"{config.model_name}_best_weights.pt"
 
@@ -73,7 +73,7 @@ def geometric_explainer_entrypoint(
     model.eval()
     print(f"[INFO] Loaded model {config.model_name} with weights.")
 
-    # Load dataset
+    # load dataset
     _, class_rgb_values, unknown_index = load_class_palette(const.CLASS_CSV)
     val_image_ids = meta.get("val_image_ids", [])
     if not val_image_ids:
@@ -97,18 +97,21 @@ def geometric_explainer_entrypoint(
         unknown_index=unknown_index,
     )
 
-    # Pick first image
+    # first image
+    # TODO: modify this so it can be done for different images
     data = val_ds[0].to(device)
     val_image_id = val_ids_subset[0]
     print(f"[INFO] Explaining graph from validation image: {val_image_id}")
 
-    # Node-level explanation
+    # we explain node level because edge / feature is not really understandable
+    # by doing so, we can highlight nodes by importance and compare that with the original iamge
+    # thus, we infer a degree of plausability for the explanation 
     explainer = Explainer(
         model=model,
         algorithm=GNNExplainer(epochs=explain_epochs),
         explanation_type=ExplanationType.model,
-        node_mask_type=MaskType.object,   # Node-level importance
-        edge_mask_type=None,               # Skip edge importance
+        node_mask_type=MaskType.object,   
+        edge_mask_type=None,              
         model_config=dict(
             mode="multiclass_classification",
             task_level="node",
@@ -116,7 +119,7 @@ def geometric_explainer_entrypoint(
         )
     )
 
-    # --- 1) General graph explanation ---
+    # graph explanation - we could remove this 
     explanation = explainer(x=data.x, edge_index=data.edge_index, index=node_idx)
     node_importance = explanation.node_mask.detach().cpu().numpy()  # [N]
 
@@ -137,7 +140,7 @@ def geometric_explainer_entrypoint(
     plt.title(f"Node Importance Heatmap: {val_image_id}")
     plt.show()
 
-    # --- 2) Single-target superpixel explanation ---
+    # -explanation for a single node (superpixel)
     target_superpixel_idx = 0
     target_heatmap = None
     target_node_importance = None
@@ -150,30 +153,30 @@ def geometric_explainer_entrypoint(
         )
         target_node_importance = target_explanation.node_mask.detach().cpu().numpy()
 
-        # Map importance to pixels
+        # map importance to pixels
         target_heatmap = np.zeros_like(sp_map, dtype=float)
         for i, score in enumerate(target_node_importance):
             target_heatmap[sp_map == i] = score
 
-        # Normalize all superpixels except the target superpixel
+        # normalize all superpixels except the target superpixel
         mask = sp_map != target_superpixel_idx
         if np.any(mask):
             min_val, max_val = target_heatmap[mask].min(), target_heatmap[mask].max()
             target_heatmap[mask] = (target_heatmap[mask] - min_val) / (max_val - min_val + 1e-8)
 
-        # Separate mask for target superpixel
+        # separate mask for target superpixel
         target_mask = sp_map == target_superpixel_idx
 
-        # Plot original image
+        # plot original image
         plt.figure(figsize=(10, 10))
         plt.imshow(img_rgb)
 
-        # Overlay normalized heatmap for other superpixels
+        # heatmap overlay: red -> most important ; blue -> least important
         plt.imshow(target_heatmap, cmap='jet', alpha=0.5)
 
-        # Overlay target superpixel as white
+        # we make the target superpixel neon green
         green_overlay = np.zeros((*sp_map.shape, 4), dtype=float)  # RGBA
-        green_overlay[target_mask] = [0.0, 1.0, 0.0, 1.0]  # neon green with full alpha
+        green_overlay[target_mask] = [0.0, 1.0, 0.0, 1.0]  
         plt.imshow(green_overlay)
 
         plt.axis('off')
