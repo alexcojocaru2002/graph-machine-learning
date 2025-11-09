@@ -46,6 +46,54 @@ MODEL_CLASS_MAP = {
 }
 
 
+# Default Hugging Face repositories for pre-trained checkpoints.
+# Update the repo ids with the actual namespaces once the models are uploaded.
+HF_MODEL_REGISTRY: Dict[str, Dict[str, Dict[str, Optional[str]]]] = {
+    "GCN2": {
+        "single_k": {
+            "repo_id": "mojique/gcn-single-k",
+            "checkpoint": "gcn2_k60_best.pt",
+            "config": "gcn2_k60_best.json",
+            "revision": None,
+        },
+        "multi_k": {
+            "repo_id": "mojique/gcn-multi-k",
+            "checkpoint": "gcn2_k60_k120_k300_k500_multi_best.pt",
+            "config": "gcn2_k60_k120_k300_k500_multi_best.json",
+            "revision": None,
+        },
+    },
+    "Transformer": {
+        "single_k": {
+            "repo_id": "mojique/transformer-single-k",
+            "checkpoint": "transformer_k60_best.pt",
+            "config": "transformer_k60_best.json",
+            "revision": None,
+        },
+        "multi_k": {
+            "repo_id": "mojique/transformer-multi-k",
+            "checkpoint": "transformer_k60_k120_k300_k500_best.pt",
+            "config": "transformer_k60_k120_k300_k500_best.json",
+            "revision": None,
+        },
+    },
+    "MultiheadGAT": {
+        "single_k": {
+            "repo_id": "mojique/gat-single-k",
+            "checkpoint": "gat_k60_best.pt",
+            "config": "gat_k60_best.json",
+            "revision": None,
+        },
+        "multi_k": {
+            "repo_id": "mojique/gat-multi-k",
+            "checkpoint": "gat_k60_k120_k300_k500_multi_best.pt",
+            "config": "gat_k60_k120_k300_k500_multi_best.json",
+            "revision": None,
+        },
+    },
+}
+
+
 class EvalModelWrapper(torch.nn.Module):
     """Wrap models to gracefully handle optional edge_index arguments."""
 
@@ -150,6 +198,43 @@ def gather_checkpoint_paths(
     if not unique_paths:
         raise RuntimeError("No checkpoints found for evaluation.")
     return unique_paths
+
+
+def download_default_hf_checkpoints() -> List[Path]:
+    """
+    Download the default set of Hugging Face checkpoints specified in HF_MODEL_REGISTRY.
+    Returns the local filesystem paths to the downloaded checkpoint files.
+    """
+
+    try:
+        from huggingface_hub import hf_hub_download  # type: ignore[import]
+    except ImportError as exc:  # pragma: no cover - informative failure path
+        raise ImportError(
+            "huggingface_hub is required to download checkpoints from Hugging Face. "
+            "Install it with `pip install huggingface_hub`."
+        ) from exc
+
+    downloaded: List[Path] = []
+    for arch, variants in HF_MODEL_REGISTRY.items():
+        for variant, spec in variants.items():
+            repo_id = spec["repo_id"]
+            checkpoint_filename = spec["checkpoint"]
+            config_filename = spec["config"]
+            revision = spec.get("revision")
+
+            if repo_id is None or checkpoint_filename is None or config_filename is None:
+                raise ValueError(
+                    f"Incomplete Hugging Face spec for {arch} ({variant}). "
+                    "Ensure repo_id, checkpoint, and config are populated."
+                )
+
+            ckpt_local = Path(
+                hf_hub_download(repo_id=repo_id, filename=checkpoint_filename, revision=revision)
+            )
+            # Ensure the associated architecture metadata is also cached locally.
+            hf_hub_download(repo_id=repo_id, filename=config_filename, revision=revision)
+            downloaded.append(ckpt_local)
+    return downloaded
 
 
 def load_model_from_checkpoint(
@@ -540,6 +625,11 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42, help="Random seed for train/test split.")
     parser.add_argument("--ckpt", action="append", default=[], help="Specific checkpoint file (.pt/.pth). Repeatable.")
     parser.add_argument("--ckpt-dir", action="append", default=[], help="Directory containing checkpoints. Repeatable.")
+    parser.add_argument(
+        "--use-hf-models",
+        action="store_true",
+        help="Download and include the default Hugging Face checkpoints defined in this file.",
+    )
     parser.add_argument("--batch-size", type=int, default=128, help="Evaluation batch size.")
     parser.add_argument("--num-workers", type=int, default=2, help="Number of DataLoader workers.")
     parser.add_argument("--device", type=str, default="auto", help="Device to use (auto, cpu, cuda, mps).")
@@ -549,6 +639,7 @@ def main() -> None:
     args = parser.parse_args()
 
     device = infer_device(args.device)
+    print(f"Using device: {device}")
     output_root = const.ARTIFACTS_DIR / "eval"
     output_root.mkdir(parents=True, exist_ok=True)
 
@@ -580,7 +671,30 @@ def main() -> None:
     unknown_index = meta["unknown_index"]
     num_classes_eff = len(class_rgb_values) - (1 if unknown_index is not None and 0 <= unknown_index < len(class_rgb_values) else 0)
 
-    ckpt_paths = gather_checkpoint_paths(args.ckpt, args.ckpt_dir, output_root)
+    ckpt_paths: List[Path] = []
+    local_error: Optional[RuntimeError] = None
+    try:
+        ckpt_paths = gather_checkpoint_paths(args.ckpt, args.ckpt_dir, output_root)
+    except RuntimeError as err:
+        local_error = err
+        ckpt_paths = []
+
+    hf_ckpt_paths: List[Path] = []
+    if args.use_hf_models:
+        hf_ckpt_paths = download_default_hf_checkpoints()
+
+    if not ckpt_paths and not args.use_hf_models:
+        # Preserve previous behaviour when Hugging Face models are not requested.
+        if local_error is not None:
+            raise local_error
+    ckpt_paths.extend(hf_ckpt_paths)
+    if not ckpt_paths:
+        raise RuntimeError(
+            "No checkpoints found locally or on Hugging Face. "
+            "Provide --ckpt/--ckpt-dir or enable --use-hf-models."
+        )
+    # Deduplicate while preserving order.
+    ckpt_paths = list(dict.fromkeys(ckpt_paths))
 
     summary_rows: List[Dict] = []
     per_class_node_rows: List[Dict] = []
