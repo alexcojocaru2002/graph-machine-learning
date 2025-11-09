@@ -19,7 +19,7 @@ if __name__ == "__main__":
 
     # ---------------- GAT ----------------
     cfg_gat = GeometricTrainConfig()
-    cfg_gat.model_name = "gat_k60_k120_k300_k500"
+    cfg_gat.model_name = "gat_k60_k120_k300_k500_multi"
     cfg_gat.k_values = [60, 120, 300, 500]  # 👈 correct place for k
     gat_model = MultiheadGAT(in_dim=1024, hidden_dim=512, out_dim=6)
     configs.append((gat_model, cfg_gat))
