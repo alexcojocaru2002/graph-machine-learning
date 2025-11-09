@@ -180,7 +180,18 @@ def geometric_explainer_entrypoint(
         plt.imshow(green_overlay)  
 
         plt.axis('off')
-        plt.title(f"Target superpixel <{target_superpixel_idx}> influence heatmap ({val_image_id})")
+        plt.title(f"Importance heatmap for superpixel #{target_superpixel_idx} ({val_image_id})")
+        
+
+        save_dir = const.ARTIFACTS_DIR / "explanation"
+        save_dir.mkdir(parents=True, exist_ok=True)
+
+        save_path = save_dir / f"{config.model_name}_{val_image_id}_sp{target_superpixel_idx}_explanation.png"
+        plt.savefig(save_path, bbox_inches="tight", dpi=300)
+        print(f"[INFO] Saved explanation heatmap to {save_path}")
+
+
         plt.show()
+        plt.close()
 
         return target_heatmap, target_node_importance, val_image_id
